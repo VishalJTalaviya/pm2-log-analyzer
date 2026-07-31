@@ -44,8 +44,6 @@ requireWasmOpt();
 run("cargo test --manifest-path wasm/pm2-core/Cargo.toml");
 run(
   "cargo build --manifest-path wasm/pm2-core/Cargo.toml --target wasm32-unknown-unknown --release",
-  root,
-  { RUSTFLAGS: "-C target-feature=+simd128" },
 );
 
 fs.mkdirSync(pkgDir, { recursive: true });
@@ -55,7 +53,7 @@ run(
 
 const wasmPath = path.join(pkgDir, "pm2_core_bg.wasm");
 run(
-  `wasm-opt -O3 --enable-simd --enable-bulk-memory -o "${wasmPath}" "${wasmPath}"`,
+  `wasm-opt -O3 --enable-simd --enable-relaxed-simd --enable-tail-call --enable-extended-const --enable-bulk-memory --enable-mutable-globals --enable-sign-ext -o "${wasmPath}" "${wasmPath}"`,
 );
 const wasm = fs.readFileSync(wasmPath);
 console.log(`wasm-opt -O3 → ${wasm.length} bytes`);
