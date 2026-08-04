@@ -16,7 +16,6 @@ export type ShardRequest =
       start: number;
       end: number;
       shardIndex: number;
-      normalizeMode?: string;
     }
   | {
       type: "PARSE_BYTES";
@@ -60,7 +59,6 @@ export type ShardParsed = {
   methodsMask: number;
   cronWire: ArrayBuffer;
   unmatchedWire: ArrayBuffer;
-  partialWire?: ArrayBuffer;
   timing: ShardTiming;
 };
 
@@ -83,7 +81,7 @@ export type ShardReady = { type: "SHARD_READY" };
 
 export type ShardModeReady = { type: "SHARD_MODE_READY"; epoch: number };
 
-const CHUNK = 16 * 1024 * 1024;
+const CHUNK = 8 * 1024 * 1024;
 const LINE_EXTEND = 256 * 1024;
 
 let engine: Pm2Engine | null = null;
@@ -96,10 +94,10 @@ function heapU8(): Uint8Array {
 
 /** Write bytes into Wasm ingest window; return length written. */
 function writeIngest(src: Uint8Array): number {
-  const len = src.length;
+  const len = Math.min(src.length, CHUNK);
   const ptr = engine!.ingest_ptr(len);
   // Re-read heap after possible grow from ingest_ptr.
-  heapU8().set(src, ptr);
+  heapU8().set(src.subarray(0, len), ptr);
   return len;
 }
 
@@ -120,53 +118,77 @@ async function parseFileRange(file: File, start: number, end: number): Promise<S
   const readEnd = Math.min(file.size, end + LINE_EXTEND);
   let off = start;
 
-  // Pipelined multi-buffered prefetch queue (depth 2) into Wasm ingest window
-  const QUEUE_DEPTH = 2;
-  const pendingReads: Promise<{ chunk: Uint8Array; readTime: number }>[] = [];
-
-  const enqueue = (chunkOff: number) => {
-    if (chunkOff >= readEnd) return;
-    const take = Math.min(CHUNK, readEnd - chunkOff);
-    const t0 = performance.now();
-    const slice = file.slice(chunkOff, chunkOff + take);
-    pendingReads.push(
-      slice.arrayBuffer().then((buf) => ({
-        chunk: new Uint8Array(buf),
-        readTime: performance.now() - t0,
-      })),
-    );
-  };
-
-  let readNextOff = off;
-  for (let q = 0; q < QUEUE_DEPTH && readNextOff < readEnd; q++) {
-    const take = Math.min(CHUNK, readEnd - readNextOff);
-    enqueue(readNextOff);
-    readNextOff += take;
+  // Try ReadableStream BYOB zero-copy reader directly into Wasm ingest_ptr
+  let byobReader: ReadableStreamBYOBReader | null = null;
+  try {
+    const slice = file.slice(start, readEnd);
+    const stream = slice.stream();
+    if (typeof stream.getReader === "function") {
+      byobReader = stream.getReader({ mode: "byob" }) as ReadableStreamBYOBReader;
+    }
+  } catch {
+    byobReader = null;
   }
 
-  while (off < readEnd && pendingReads.length > 0) {
-    const chunkOff = off;
-    const take = Math.min(CHUNK, readEnd - off);
-    off += take;
+  if (byobReader) {
+    try {
+      while (off < readEnd) {
+        const take = Math.min(CHUNK, readEnd - off);
+        const ptr = engine!.ingest_ptr(take);
+        const destView = new Uint8Array(wasmMemory!.buffer, ptr, take);
 
-    if (readNextOff < readEnd) {
-      const takeNext = Math.min(CHUNK, readEnd - readNextOff);
-      enqueue(readNextOff);
-      readNextOff += takeNext;
+        const t0 = performance.now();
+        const { value, done } = await byobReader.read(destView);
+        readMs += performance.now() - t0;
+
+        if (done || !value || value.byteLength === 0) break;
+
+        const tFeed = performance.now();
+        engine!.feed(value.byteLength, off);
+        feedMs += performance.now() - tFeed;
+
+        off += value.byteLength;
+        if (off >= end + LINE_EXTEND) break;
+      }
+
+      const tEnd = performance.now();
+      engine!.end_shard();
+      const endShardMs = performance.now() - tEnd;
+
+      return {
+        readMs,
+        copyIngestMs: 0,
+        feedMs,
+        endShardMs,
+        metaWireMs: 0,
+        shardWallMs: readMs + feedMs + endShardMs,
+      };
+    } catch {
+      // Fallback if browser stream fails or BYOB detaches
+    } finally {
+      try {
+        byobReader.releaseLock();
+      } catch {}
     }
+  }
 
-    const { chunk, readTime } = await pendingReads.shift()!;
-    readMs += readTime;
+  // Fallback: Slice reading into Wasm ingest window
+  while (off < readEnd) {
+    const take = Math.min(CHUNK, readEnd - off);
+    const t0 = performance.now();
+    const chunk = new Uint8Array(await file.slice(off, off + take).arrayBuffer());
+    readMs += performance.now() - t0;
 
     const tCopy = performance.now();
     const n = writeIngest(chunk);
     copyIngestMs += performance.now() - tCopy;
 
     const tFeed = performance.now();
-    engine!.feed(n, chunkOff);
+    engine!.feed(n, off);
     feedMs += performance.now() - tFeed;
 
-    if (chunkOff >= end + LINE_EXTEND) break;
+    off += take;
+    if (off >= end + LINE_EXTEND) break;
   }
 
   const tEnd = performance.now();
@@ -219,12 +241,9 @@ self.onmessage = async (e: MessageEvent<ShardRequest>) => {
     }
 
     if (msg.type === "PARSE_SHARD") {
-      const { file, start, end, shardIndex, epoch, normalizeMode } = msg;
+      const { file, start, end, shardIndex, epoch } = msg;
       engine.clear();
       const timing = await parseFileRange(file, start, end);
-      const modeCode = normalizeModeCode(normalizeMode ?? "collapseIds");
-      engine.ensure_mode(modeCode);
-      const partialWire = engine.reaggregate(modeCode, 0, 0, true).buffer;
       const tMeta = performance.now();
       const { cronWire, unmatchedWire } = metaBuffers();
       timing.metaWireMs = performance.now() - tMeta;
@@ -243,10 +262,9 @@ self.onmessage = async (e: MessageEvent<ShardRequest>) => {
         methodsMask: engine.methods_mask(),
         cronWire,
         unmatchedWire,
-        partialWire,
         timing,
       };
-      self.postMessage(result, [cronWire, unmatchedWire, partialWire]);
+      self.postMessage(result, [cronWire, unmatchedWire]);
       return;
     }
 
