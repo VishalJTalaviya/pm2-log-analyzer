@@ -10,7 +10,11 @@ use rapidhash::fast::RandomState;
 
 const LINE_EXTEND: usize = 256 * 1024;
 /// Reusable ingest window. Keeps Wasm peak memory bounded.
-pub const INGEST_CAP: usize = 8 * 1024 * 1024;
+/// Wasm linear memory is committed in real pages and never returned on shrink,
+/// so this cap directly bounds per-worker RSS. Chunks are 16 MiB; 32 MiB gives
+/// headroom for the 256 KiB line-extend carry without paying for a 512 MiB
+/// window × worker pool.
+pub const INGEST_CAP: usize = 32 * 1024 * 1024;
 
 /// Path/norm indexes: rapidhash beats foldhash on byte keys.
 type ByteMap<V> = HashMap<Vec<u8>, V, RandomState>;
@@ -86,6 +90,7 @@ pub struct Engine {
     file_size: u64,
     skip_partial: bool,
     parsing: bool,
+    last_path_id: Option<u32>,
 }
 
 impl Engine {
@@ -120,15 +125,15 @@ impl Engine {
             file_size: 0,
             skip_partial: false,
             parsing: false,
+            last_path_id: None,
         }
     }
 
     pub fn clear(&mut self) {
-        let cap = self.ingest.capacity();
+        // Release the columnar store entirely: Wasm linear memory never shrinks,
+        // so retaining Vec/HashMap capacity across parses pins multi-GB of pages
+        // per worker. Drop everything so the next parse reallocates as needed.
         *self = Self::new();
-        if cap > 0 {
-            self.ingest.reserve(cap.min(INGEST_CAP));
-        }
     }
 
     pub fn hit_count(&self) -> usize {
@@ -198,6 +203,7 @@ impl Engine {
         self.summary_slow = 0;
         self.summary_sketch = RelHist::new();
         self.summary_ready = false;
+        self.last_path_id = None;
     }
 
     /// Feed `len` bytes already written at ingest[0..len] starting at absolute `abs_off`.
@@ -512,19 +518,31 @@ impl Engine {
     }
 
     fn intern_path(&mut self, path: &[u8]) -> u32 {
-        let next_id = self.path_off.len() as u32;
-        match self.path_index.entry_ref(path) {
-            EntryRef::Occupied(e) => return *e.get(),
-            EntryRef::Vacant(e) => {
-                e.insert(next_id);
+        if let Some(last_id) = self.last_path_id {
+            let last_id_usize = last_id as usize;
+            if last_id_usize < self.path_off.len() {
+                let off = self.path_off[last_id_usize] as usize;
+                let len = self.path_len[last_id_usize] as usize;
+                if path.len() == len && &self.path_bytes[off..off + len] == path {
+                    return last_id;
+                }
             }
         }
-        let off = self.path_bytes.len() as u32;
-        self.path_bytes.extend_from_slice(path);
-        self.path_off.push(off);
-        self.path_len.push(path.len() as u16);
-        self.mode_ready = [false; 3];
-        next_id
+        let next_id = self.path_off.len() as u32;
+        let pid = match self.path_index.entry_ref(path) {
+            EntryRef::Occupied(e) => *e.get(),
+            EntryRef::Vacant(e) => {
+                e.insert(next_id);
+                let off = self.path_bytes.len() as u32;
+                self.path_bytes.extend_from_slice(path);
+                self.path_off.push(off);
+                self.path_len.push(path.len() as u16);
+                self.mode_ready = [false; 3];
+                next_id
+            }
+        };
+        self.last_path_id = Some(pid);
+        pid
     }
 
     fn path_slice(&self, id: usize) -> &[u8] {
@@ -640,7 +658,11 @@ impl Engine {
             _ => -1,
         };
 
-        // Dense slots for low-cardinality modes: (norm_id << 3) | method
+        // Dense slots for low-cardinality modes: (norm_id << 3) | method.
+        // Sparse Vec<Option<Box<...>>>: None slots cost 1 byte (null pointer), so
+        // the array stays ~n_norm×8 bytes even with millions of paths, while only
+        // active endpoints pay for a heap Box. A flat Vec<EndpointAcc> here would
+        // commit ~80 bytes × n_norm×8 per shard — multi-GB across the worker pool.
         let use_dense = mode != 0;
         let n_norm = self.norm_off[mode].len();
         let dense_len = if use_dense {
