@@ -25,7 +25,7 @@ The story starts earlier than either corpus: before [`ef58f1f`](https://github.c
 |-------|--------|
 | UI | React 19, Tailwind CSS 4, Zustand, Recharts, react-window |
 | App shell | TypeScript 7 (strict), Vite 8 |
-| Tooling | npm, oxlint, oxfmt, Playwright (browser benches) |
+| Tooling | pnpm, oxlint, oxfmt, Playwright (browser benches) |
 | Parse / reagg | Rust → Wasm (`wasm/pm2-core`), `wasm-bindgen` 0.2.126, Binaryen `wasm-opt -O3` |
 | Hot crates | `hashbrown` 0.17 (foldhash for RelHist), `rapidhash` 4 (path maps), `memchr` 2.8 (SIMD newlines / `memmem`) |
 | Workers | 4 persistent shard workers; chunked 8 MiB ingest into Wasm linear memory (`ingest_ptr` + `feed`) |
@@ -36,8 +36,8 @@ The story starts earlier than either corpus: before [`ef58f1f`](https://github.c
 ## Quick start
 
 ```bash
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 Open the URL Vite prints, drop a `.log` file.
@@ -45,8 +45,8 @@ Open the URL Vite prints, drop a `.log` file.
 ### Production build
 
 ```bash
-npm run build
-npm run preview
+pnpm build
+pnpm preview
 ```
 
 Output is a single `dist/index.html` (plus a small logo asset).
@@ -54,9 +54,9 @@ Output is a single `dist/index.html` (plus a small logo asset).
 ### Lint / format / self-check
 
 ```bash
-npm run lint
-npm run fmt
-npm run selfcheck
+pnpm lint
+pnpm fmt
+pnpm selfcheck
 ```
 
 ---
@@ -70,8 +70,8 @@ Needed only when changing `wasm/pm2-core`. Requires:
 - `wasm-opt` from [Binaryen](https://github.com/WebAssembly/binaryen/releases) **on PATH** (build fails if missing)
 
 ```bash
-npm run wasm:build    # cargo test + release Wasm + wasm-opt + embed into src/wasm/pm2CoreBytes.ts
-npm run build
+pnpm wasm:build    # cargo test + release Wasm + wasm-opt + embed into src/wasm/pm2CoreBytes.ts
+pnpm build
 ```
 
 On Windows, if `cargo install wasm-bindgen-cli` fails (e.g. missing `dlltool`), install the matching [GitHub release binary](https://github.com/wasm-bindgen/wasm-bindgen/releases) into a directory on your PATH.
@@ -83,7 +83,7 @@ On Windows, if `cargo install wasm-bindgen-cli` fails (e.g. missing `dlltool`), 
 ### How to run
 
 ```bash
-npm run build
+pnpm build
 node scripts/bench/bench.mjs --runs 5 --note "my-note"
 # defaults to test_data/api-out-5gb.log (~5.22 GiB); pass a path to override:
 # node scripts/bench/bench.mjs test_data/api-out-500mb.log --runs 5 --note "500mb"
@@ -150,28 +150,26 @@ Quiet stage map at the sub-1s point (avg ms): `feed≈524` (still the largest sl
 
 #### 2. Scale-up: 5 GiB default corpus (`5gb default`)
 
-Default bench file switched to `test_data/api-out-5gb.log` (~5.22 GiB / ~5350 MiB) — same line mix as the 535 MiB corpus, repeated 10×. With WebAssembly 3.0 target optimizations, 16-byte cache-aligned `PackedEntry` struct packing, SIMD `memchr_iter` batch line scanning, SIMD `memchr3` token delimiters, L1 path cache, sparse `EndpointAcc` reagg, prekicked zero-IPC first reagg, a **bounded 32 MiB ingest window**, and a **4-worker pool** — restoring the pre-commit RSS profile that the last commit's 16-worker bump blew up (each worker ≈ +1 GiB Chromium RSS) (session in `history.json`, 5-run average including cold startup):
+Default bench file switched to `test_data/api-out-5gb.log` (~5.22 GiB / ~5350 MiB) — same line mix as the 535 MiB corpus, repeated 10×. With WebAssembly 3.0 target optimizations, 16-byte cache-aligned `PackedEntry` struct packing, SIMD `memchr_iter` batch line scanning, zero-copy `ReadableStream` BYOB stream ingestion directly into Wasm linear memory, fat LTO, and arena pre-allocations (session **70** in `history.json`, 5-run average including cold startup):
 
 | Metric | Avg (±stddev) |
 |--------|----------------|
-| Parse wall | **6.00 s ± 0.21** |
-| Upload → KPI ready | **6.02 s ± 0.21** |
-| Throughput | **893.3 MB/s** |
-| Chromium RSS peak | **~3.5 GiB** (matches pre-commit ~2.7–3.9 GiB; vs ~8 GiB at 8–16 workers) |
-| Worker Wasm heap | **~2.4 GiB** (columnar store: 36.6M hits × 16 B + path/norm arenas — corpus-inherent) |
-| Committed ingest pages | **128 MiB** (4 × 32 MiB, vs up to 8 GiB at 512 MiB × 16 workers) |
-| Reagg avg | **278 ms** |
+| Parse wall | **7.98 s ± 0.05** |
+| Upload → KPI ready | **8.00 s ± 0.05** |
+| Throughput | **670.6 MB/s** |
+| Chromium RSS peak | **~2.65 GiB** (down from ~3.93 GiB) |
 
 - **16-Byte Contiguous Entry Packing:** Replaced 4 separate vectors with a single 16-byte aligned `PackedEntry` struct vector (`entries: Vec<PackedEntry>`), cutting vector allocation push overhead by 4x and maximizing CPU L1/L2 cache hit rates.
 - **SIMD Batch Newline Iterator:** Batched up to 32 line break offsets per call via `memchr::memchr_iter(b'\n', rest)` into a stack buffer, processing lines in unrolled tight loops.
 - **Zero-Copy BYOB Stream Ingestion:** Bytes stream directly from disk into Wasm `ingest_ptr` linear memory without intermediate V8 `ArrayBuffer` allocations (`copy = 0 ms`).
 - **Wasm 3.0 + Fat LTO:** Compiled with `-C target-feature=+simd128,+relaxed-simd,+tail-call,+extended-const` and whole-program LLVM link-time optimization (`lto = true`).
+| Reagg avg | **295 ms** |
 
 Result parity: matched **36,572,842**, unmatched **27,427,800**, endpoints **6,107**, cron **9**.
 
-Stages (avg ms): `read≈10634` (max across shards, double-buffered prefetch), `feed≈4301`, `endShard≈246`, `firstReagg≈77`; warm reagg `shard≈224` / `decode≈11` / `finish≈25`. The `read` stage is the file-read wall on the slowest shard (5 GiB / 4 shards ≈ 1.25 GB each), not the parse bottleneck — total wall stays ~6.0 s because shards overlap.
+Stages (avg ms): `read≈1386`, `feed≈5456`, `endShard≈310`, `firstReagg≈919` (`shard≈838` / `decode≈39` / `finish≈42`); warm reagg `shard≈225` / `decode≈12` / `finish≈24`.
 
-Rough scale check vs quiet 535 MiB (~0.98 s parse / ~86 ms reagg / ~1.15 GiB RSS): ~10× bytes → ~6× parse wall, ~3.2× reagg, worker Wasm heap grows sub-linearly (same endpoint cardinality → ~2.4 GiB for 5 GiB corpus). The committed ingest window is bounded to 4 × 32 MiB = 128 MiB regardless of file size.
+Rough scale check vs quiet 535 MiB (~0.98 s parse / ~86 ms reagg / ~1.15 GiB RSS): ~10× bytes → ~8.6× parse wall, ~3.7× reagg, ~3.4× RSS peak — feed still dominates; first reagg and RSS grow sub-linearly with the repeated corpus (same endpoint cardinality).
 
 ### Architecture (current)
 
@@ -179,7 +177,7 @@ Rough scale check vs quiet 535 MiB (~0.98 s parse / ~86 ms reagg / ~1.15�
 File drop
   → coordinator worker (compile Wasm module once)
   → 4 shard workers, each with one Pm2Engine
-       write 16 MiB chunks into a 32 MiB Wasm ingest window
+       write 8 MiB chunks into Wasm ingest window
        feed / end_shard → columnar hits + path arena + summary
        early shards: ENSURE_MODE(collapseIds) while siblings still feed
   → absorb cron/unmatched meta

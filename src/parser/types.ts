@@ -63,23 +63,11 @@ export type ParseOptions = {
   cronShowFailedOnly: boolean;
 };
 
-export type HourlyBucket = {
-  hour: number;
-  label: string;
-  count: number;
-  errorCount: number;
-  avgMs: number;
-  p95Ms: number;
-  p99Ms: number;
-  maxMs: number;
-};
-
 export type AggregatedResult = {
   api: AggregatedEndpoint[];
   cron: CronAggregated[];
   summary: LogSummary;
   cronSummary: CronSummary;
-  hourlyStats: HourlyBucket[];
   methods: string[];
   unmatchedSample: string[];
   unmatchedCount: number;
@@ -97,7 +85,6 @@ export type HttpRequestHit = {
   path: string;
   status: number;
   durationMs: number;
-  hour?: number;
 };
 
 export type ParsedLine =
@@ -123,9 +110,7 @@ export const EMPTY_RESULT: AggregatedResult = {
   cron: [],
   summary: { matched: 0, unmatched: 0, max: 0, avg: 0, p95Ms: 0, errors: 0, slow: 0 },
   cronSummary: { starts: 0, dones: 0, fails: 0, jobs: 0, slowestRun: 0 },
-  hourlyStats: [],
   methods: [],
   unmatchedSample: [],
   unmatchedCount: 0,
 };
-
