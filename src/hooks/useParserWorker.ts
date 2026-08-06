@@ -24,8 +24,6 @@ type Pm2Bench = {
   cronJobs?: number;
   p95Ms?: number;
   crossOriginIsolated?: boolean;
-  /** Total Wasm linear memory across shard workers (MB). */
-  workerWasmHeapMB?: number;
   stages?: ParsePerfStages;
   reaggTimes: number[];
   reaggStages: ReaggPerfStages[];
@@ -99,9 +97,6 @@ export function useParserWorker() {
           rejectRef.current = null;
           break;
         case "DONE":
-          if (msg.payload?.workerWasmHeapMB != null) {
-            ensureBench({ workerWasmHeapMB: msg.payload.workerWasmHeapMB });
-          }
           break;
       }
     };
@@ -155,8 +150,8 @@ export function useParserWorker() {
         crossOriginIsolated: window.crossOriginIsolated,
         reaggTimes: [],
         reaggStages: [],
-        parseWallMs: 0,
-        workerWasmHeapMB: 0,
+        stages: undefined,
+        parseWallMs: undefined,
       });
       const t0 = performance.now();
       await run({ type: "PARSE_FILE", payload: { file, options } });
@@ -184,8 +179,8 @@ export function useParserWorker() {
         source: "text",
         reaggTimes: [],
         reaggStages: [],
-        parseWallMs: 0,
-        workerWasmHeapMB: 0,
+        stages: undefined,
+        parseWallMs: undefined,
       });
       const t0 = performance.now();
       await run({ type: "PARSE_TEXT", payload: { text, options } });

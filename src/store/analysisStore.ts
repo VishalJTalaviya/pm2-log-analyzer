@@ -55,10 +55,7 @@ const DEFAULT_FILTERS: AnalysisFilters = {
   cronSortKey: "p95Ms",
 };
 
-export type Theme = "light" | "dark";
-
 type AnalysisState = {
-  theme: Theme;
   sourceKind: SourceKind;
   fileName: string | null;
   fileSize: number | null;
@@ -72,8 +69,6 @@ type AnalysisState = {
   toast: string | null;
   pasteOpen: boolean;
 
-  toggleTheme: () => void;
-  setTheme: (theme: Theme) => void;
   setWorkerReady: (ready: boolean) => void;
   setParsing: (parsing: boolean) => void;
   setProgress: (progress: ParseProgress | null) => void;
@@ -93,7 +88,6 @@ type AnalysisState = {
 export const useAnalysisStore = create<AnalysisState>()(
   persist(
     (set, get) => ({
-      theme: "light",
       sourceKind: "none",
       fileName: null,
       fileSize: null,
@@ -107,8 +101,6 @@ export const useAnalysisStore = create<AnalysisState>()(
       toast: null,
       pasteOpen: false,
 
-      toggleTheme: () => set({ theme: get().theme === "light" ? "dark" : "light" }),
-      setTheme: (theme) => set({ theme }),
       setWorkerReady: (ready) => set({ isWorkerReady: ready }),
       setParsing: (parsing) => set({ isParsing: parsing }),
       setProgress: (progress) => set({ progress }),
@@ -149,7 +141,7 @@ export const useAnalysisStore = create<AnalysisState>()(
     }),
     {
       name: "pm2-analyzer-filters",
-      partialize: (s) => ({ filters: s.filters, theme: s.theme }),
+      partialize: (s) => ({ filters: s.filters }),
     },
   ),
 );

@@ -4,7 +4,6 @@
 
 import {
   aggregateCron,
-  buildHourlyStats,
   finishApiFromPartials,
   type AggregatedResult,
   type AggPartial,
@@ -92,11 +91,7 @@ export type WorkerResponse =
   | { type: "RESULT"; payload: AggregatedResult }
   | { type: "PERF"; payload: ParsePerfStages | ReaggPerfStages }
   | { type: "ERROR"; payload: { message: string } }
-  | {
-      type: "DONE";
-      /** Debug probe: total Wasm linear memory across shard workers (MB). */
-      payload?: { workerWasmHeapMB?: number };
-    };
+  | { type: "DONE" };
 
 let cancelled = false;
 let epoch = 0;
@@ -120,7 +115,7 @@ let lastParsePartial: Omit<
   | "decodePartialsMs"
   | "finishApiMs"
   | "totalParseMs"
-> & { workerWasmHeapMB?: number; paths?: number } | null = null;
+> | null = null;
 let parseWallOrigin = 0;
 
 function poolSize(): number {
@@ -128,10 +123,6 @@ function poolSize(): number {
     typeof navigator !== "undefined" && navigator.hardwareConcurrency
       ? navigator.hardwareConcurrency
       : 4;
-  // Cap the shard pool: each worker holds its own Wasm linear memory, so the
-  // pool size multiplies per-worker RSS (~1 GB per shard for a 5 GiB corpus).
-  // 4 workers matches the pre-commit profile (~3 GB Chromium RSS peak) while
-  // still keeping 5 GiB parses near peak throughput.
   return Math.max(2, Math.min(4, hc));
 }
 
@@ -316,8 +307,6 @@ type ReaggTiming = {
   totalMs: number;
 };
 
-let prekickedPartials: { epoch: number; options: ParseOptions; tasks: Promise<ShardPartial>[] } | null = null;
-
 async function reaggregateShards(
   options: ParseOptions,
 ): Promise<{ result: AggregatedResult; timing: ReaggTiming }> {
@@ -336,31 +325,19 @@ async function reaggregateShards(
   } satisfies WorkerResponse);
 
   const t0 = performance.now();
-  let tasks: Promise<ShardPartial>[];
-  if (
-    prekickedPartials &&
-    prekickedPartials.epoch === epoch &&
-    prekickedPartials.options.normalizeMode === options.normalizeMode &&
-    prekickedPartials.options.statusFamily === options.statusFamily &&
-    prekickedPartials.options.minMs === options.minMs
-  ) {
-    tasks = prekickedPartials.tasks;
-    prekickedPartials = null;
-  } else {
-    tasks = [];
-    for (let i = 0; i < activeShardCount; i++) {
-      tasks.push(
-        runShardPartial(shardPool[i]!, {
-          type: "REAGGREGATE",
-          epoch,
-          shardIndex: i,
-          normalizeMode: options.normalizeMode,
-          statusFamily: options.statusFamily,
-          minMs: options.minMs,
-          needSummary,
-        }),
-      );
-    }
+  const tasks: Promise<ShardPartial>[] = [];
+  for (let i = 0; i < activeShardCount; i++) {
+    tasks.push(
+      runShardPartial(shardPool[i]!, {
+        type: "REAGGREGATE",
+        epoch,
+        shardIndex: i,
+        normalizeMode: options.normalizeMode,
+        statusFamily: options.statusFamily,
+        minMs: options.minMs,
+        needSummary,
+      }),
+    );
   }
   const wires = await Promise.all(tasks);
   wires.sort((a, b) => a.shardIndex - b.shardIndex);
@@ -404,7 +381,6 @@ async function reaggregateShards(
       jobs: cron.length,
       slowestRun: cron.reduce((m, r) => Math.max(m, r.maxMs), 0),
     },
-    hourlyStats: buildHourlyStats(undefined, api),
     methods: methodList,
     unmatchedSample,
     unmatchedCount,
@@ -427,6 +403,7 @@ async function parseFileSharded(file: File, normalizeMode: string) {
   const n = shardCountFor(file.size);
   const { wasmCompileMs, shardPoolInitMs } = await ensureShardPool();
   clearShards(ep);
+  const modeCode = normalizeModeCode(normalizeMode);
 
   const total = file.size || 1;
   const lastProgress = { t: 0 };
@@ -467,56 +444,34 @@ async function parseFileSharded(file: File, normalizeMode: string) {
 
   try {
     if (cancelled) throw new Error("Cancelled");
-    const defaultOptions: ParseOptions = {
-      normalizeMode: normalizeMode as any,
-      statusFamily: "all",
-      minMs: 0,
-    };
-    const prekickedTasks: Promise<ShardPartial>[] = Array.from({ length: ranges.length });
-    prekickedPartials = { epoch: ep, options: defaultOptions, tasks: prekickedTasks };
-
+    const pendingEnsure: Promise<void>[] = [];
     const results = await Promise.all(
-      ranges.map(async (r, i) => {
-        if (i > 0) {
-          await new Promise((resolve) => setTimeout(resolve, i * 4));
-        }
-        const parsed = await runShardParsed(shardPool[i]!, {
+      ranges.map((r, i) => {
+        const p = runShardParsed(shardPool[i]!, {
           type: "PARSE_SHARD",
           epoch: ep,
           file,
           start: r.start,
           end: r.end,
           shardIndex: i,
-          normalizeMode,
+        }).then((parsed) => {
+          completedBytes += r.end - r.start;
+          // Overlap ensure_mode with sibling shards still feeding.
+          pendingEnsure.push(runShardEnsureMode(shardPool[i]!, ep, modeCode));
+          return parsed;
         });
-        completedBytes += r.end - r.start;
-        if (parsed.partialWire) {
-          prekickedTasks[i] = Promise.resolve({
-            type: "SHARD_PARTIAL",
-            shardIndex: i,
-            epoch: ep,
-            partial: parsed.partialWire,
-            reaggMs: 0,
-          });
-        }
-        return parsed;
+        return p;
       }),
     );
+    await Promise.all(pendingEnsure);
     if (ep !== epoch) throw new Error("Cancelled");
     results.sort((a, b) => a.shardIndex - b.shardIndex);
     const mt = maxTiming(results);
+    const tM = performance.now();
     absorbMeta(results);
     activeShardCount = results.length;
-    const wasmHeapMB = results.reduce((s, r) => s + (r.wasmHeapBytes ?? 0), 0) / (1024 * 1024);
-    const perShardEntryMB = results.reduce((s, r) => s + ((r.hitCount * 16) / (1024 * 1024)), 0);
-    self.postMessage({
-      type: "PROGRESS",
-      payload: { stage: "parsing", processed: total, total, percent: 100 },
-    } satisfies WorkerResponse);
-    const pathCount = results.reduce((s, r) => s + (r.pathCount ?? 0), 0);
-    console.info(
-      `[memprobe] shards=${results.length} wasmTotal=${wasmHeapMB.toFixed(1)}MB entriesMB=${perShardEntryMB.toFixed(1)} paths=${pathCount}`,
-    );
+    const mergeMetaMs = performance.now() - tM;
+    postProgress(total, true);
     lastParsePartial = {
       wasmCompileMs,
       shardPoolInitMs,
@@ -526,10 +481,8 @@ async function parseFileSharded(file: File, normalizeMode: string) {
       endShardMs: mt.endShardMs,
       metaWireMs: mt.metaWireMs,
       shardWallMaxMs: mt.shardWallMs,
-      mergeMetaMs: 0,
+      mergeMetaMs,
       shardCount: results.length,
-      workerWasmHeapMB: wasmHeapMB,
-      paths: pathCount,
     };
   } finally {
     clearInterval(progressTimer);
@@ -612,13 +565,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
         } satisfies WorkerResponse);
       }
       self.postMessage({ type: "RESULT", payload: result } satisfies WorkerResponse);
-      const heapMB = lastParsePartial?.workerWasmHeapMB;
-      self.postMessage(
-        {
-          type: "DONE",
-          ...(heapMB != null ? { payload: { workerWasmHeapMB: heapMB } } : {}),
-        } satisfies WorkerResponse,
-      );
+      self.postMessage({ type: "DONE" } satisfies WorkerResponse);
       return;
     }
 

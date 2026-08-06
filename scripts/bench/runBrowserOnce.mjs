@@ -174,7 +174,6 @@ try {
   const finalBench = await page.evaluate(() => window.__PM2_BENCH__);
   const reaggTimes = finalBench?.reaggTimes ?? [];
   const metricsAfter = await chromeMetrics();
-  const workerWasmHeapMB = finalBench?.workerWasmHeapMB ?? null;
 
   const rssVals = memSamples.map((s) => s.browserRssMB).filter((n) => typeof n === "number" && n > 0);
   const heapVals = memSamples.map((s) => s.jsHeapUsedMB).filter((n) => typeof n === "number");
@@ -207,7 +206,6 @@ try {
       browserRssBeforeMB: memSamples.find((s) => s.label === "before")?.browserRssMB ?? null,
       browserRssAfterMB: memSamples.at(-1)?.browserRssMB ?? null,
       browserRssPeakMB: rssVals.length ? Math.max(...rssVals) : null,
-      workerWasmHeapMB,
       jsHeapUsedBeforeMB: memSamples.find((s) => s.label === "before")?.jsHeapUsedMB ?? null,
       jsHeapUsedAfterMB: metricsAfter.jsHeapUsedMB,
       jsHeapPeakMB: heapVals.length ? Math.max(...heapVals) : null,
