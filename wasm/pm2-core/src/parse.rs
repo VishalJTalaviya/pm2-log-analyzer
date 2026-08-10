@@ -7,8 +7,7 @@ pub enum Method {
     Put = 2,
     Patch = 3,
     Delete = 4,
-    Options = 5,
-    Head = 6,
+    Head = 5,
 }
 
 impl Method {
@@ -19,8 +18,7 @@ impl Method {
             2 => Some(Self::Put),
             3 => Some(Self::Patch),
             4 => Some(Self::Delete),
-            5 => Some(Self::Options),
-            6 => Some(Self::Head),
+            5 => Some(Self::Head),
             _ => None,
         }
     }
@@ -32,7 +30,6 @@ impl Method {
             Self::Put => "PUT",
             Self::Patch => "PATCH",
             Self::Delete => "DELETE",
-            Self::Options => "OPTIONS",
             Self::Head => "HEAD",
         }
     }
@@ -124,15 +121,14 @@ fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<(usize, usize,
 
 fn parse_method(buf: &[u8], mut i: usize, end: usize) -> Option<(Method, usize)> {
     i = skip_space_ansi(buf, i, end);
-    // Frequency order for this corpus (GET/POST dominate).
+    // Frequency order for this corpus (GET/POST dominate; OPTIONS is dropped as noise).
     const METHODS: &[(Method, &[u8])] = &[
         (Method::Get, b"GET"),
         (Method::Post, b"POST"),
         (Method::Put, b"PUT"),
-        (Method::Head, b"HEAD"),
         (Method::Patch, b"PATCH"),
+        (Method::Head, b"HEAD"),
         (Method::Delete, b"DELETE"),
-        (Method::Options, b"OPTIONS"),
     ];
     for &(method, bytes) in METHODS {
         if i + bytes.len() > end {
@@ -226,6 +222,89 @@ fn has_non_space(buf: &[u8], start: usize, end: usize) -> bool {
             continue;
         }
         i += 1;
+    }
+    false
+}
+
+/// Line content after the optional PM2 timestamp + leading whitespace.
+fn noise_body<'a>(buf: &'a [u8], start: usize, end: usize) -> &'a [u8] {
+    let mut i = skip_space_ansi(buf, start, end);
+    if let Some((ni, _, _, _)) = skip_timestamp(buf, i, end) {
+        if ni != i {
+            i = ni;
+        }
+    }
+    let mut s = i;
+    while s < end && (buf[s] == b' ' || buf[s] == b'\t') {
+        s += 1;
+    }
+    &buf[s..end]
+}
+
+/// Socket.IO / socket connection noise: preflight `OPTIONS` is handled by dropping
+/// the method; these are the chat/tracking lines that are pure noise for HTTP analysis.
+fn is_socket_noise(buf: &[u8], start: usize, end: usize) -> bool {
+    let body = noise_body(buf, start, end);
+    if body.is_empty() {
+        return false;
+    }
+    let c0 = body[0];
+    if c0.is_ascii_alphabetic() {
+        let word_len = body
+            .iter()
+            .take_while(|&&c| c.is_ascii_alphanumeric())
+            .count();
+        let word = &body[..word_len];
+        let after = &body[word_len..];
+        // `New Connection {…}`, `disconnected {…}`, `join {`, `leave {`
+        let mut after_trim = after;
+        while after_trim
+            .first()
+            .is_some_and(|&c| c == b' ' || c == b'\t')
+        {
+            after_trim = &after_trim[1..];
+        }
+        let word_is_socket = word == b"New" || word == b"disconnected" || word == b"join" || word == b"leave";
+        if word_is_socket && (after_trim.starts_with(b"Connection {") || after_trim.starts_with(b"{")) {
+            return true;
+        }
+        // `Token parts: [`
+        if word == b"Token" && after.starts_with(b" parts: [") {
+            return true;
+        }
+        // `method: 'join'` / `method: 'disconnect'`
+        if word == b"method" && (after.starts_with(b": 'join'") || after.starts_with(b": 'disconnect'")) {
+            return true;
+        }
+        // `address: '::ffff:` (socket connection dumps)
+        if word == b"address" && after.starts_with(b": '::ffff:") {
+            return true;
+        }
+        // `id: '…` (Socket.IO connection-id dumps)
+        if word == b"id" && after.starts_with(b": '") && body.len() <= 64 {
+            return true;
+        }
+        return false;
+    }
+    // Socket.IO frame fragments: bare `{`/`}`/`[`/`]` (optionally with trailing comma/space),
+    // `{ 'socketId': … }` maps, `] { …` and `] Length: N` leave-frame tails.
+    let bare = body[1..]
+        .iter()
+        .all(|&c| c == b' ' || c == b'\t' || c == b',');
+    if c0 == b'{' {
+        return bare || body.starts_with(b"{ '");
+    }
+    if c0 == b'[' {
+        return bare;
+    }
+    if c0 == b'}' {
+        return bare;
+    }
+    if c0 == b']' {
+        if body.starts_with(b"] {") || body.starts_with(b"] Length:") {
+            return true;
+        }
+        return bare;
     }
     false
 }
@@ -429,16 +508,54 @@ pub fn parse_line_bytes(buf: &[u8], start: usize, mut end: usize) -> LineKind {
     if start >= end {
         return LineKind::Empty;
     }
-    if let Some(k) = try_http_a(buf, start, end) {
-        return k;
+    // First non-space/ANSI byte gates the pattern probes. httpA needs a
+    // method letter (G/P/H/D) or a digit (timestamp first); httpB needs a
+    // digit (duration first); cron needs '['. Skipping failed probes for the
+    // ~67% non-httpA lines is the cheapest parse win available.
+    let mut gate = start;
+    loop {
+        gate = skip_ansi(buf, gate, end);
+        if gate >= end {
+            return LineKind::Empty;
+        }
+        let c = buf[gate];
+        if c == b' ' || c == b'\t' {
+            gate += 1;
+            continue;
+        }
+        break;
     }
-    if find_cron_mark(buf, start, end).is_some() {
-        if let Some(k) = try_cron(buf, start, end) {
+    let g = buf[gate];
+    let method_start = matches!(g, b'G' | b'P' | b'H' | b'D');
+    // httpB (duration-first) allows a leading '.' (e.g. `.5ms GET /x`).
+    let float_start = g.is_ascii_digit() || g == b'.';
+    let cron_start = g == b'[';
+
+    if method_start || float_start {
+        if let Some(k) = try_http_a(buf, start, end) {
             return k;
         }
     }
-    if let Some(k) = try_http_b(buf, start, end) {
-        return k;
+    if cron_start {
+        if let Some(k) = try_cron(buf, start, end) {
+            return k;
+        }
+    } else if float_start && g.is_ascii_digit() {
+        // Timestamp-first lines may still embed `[cron]` after the timestamp.
+        if find_cron_mark(buf, start, end).is_some() {
+            if let Some(k) = try_cron(buf, start, end) {
+                return k;
+            }
+        }
+    }
+    if float_start {
+        if let Some(k) = try_http_b(buf, start, end) {
+            return k;
+        }
+    }
+    if is_socket_noise(buf, start, end) {
+        // Socket.IO / socket tracking lines are pure noise — skip like empty lines.
+        return LineKind::Empty;
     }
     if !has_non_space(buf, start, end) {
         LineKind::Empty
@@ -514,11 +631,76 @@ mod tests {
     }
 
     #[test]
+    fn http_b_leading_dot() {
+        // Duration-first lines may start with '.' (e.g. `.5ms GET /x`).
+        let s = b".5ms GET /api/dot";
+        match parse_line_bytes(s, 0, s.len()) {
+            LineKind::Http {
+                method,
+                path_start,
+                path_end,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(method, Method::Get);
+                assert_eq!(&s[path_start..path_end], b"/api/dot");
+                assert!((duration_ms - 0.5).abs() < 0.01);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn empty_and_unmatched() {
         assert!(matches!(parse_line_bytes(b"   ", 0, 3), LineKind::Empty));
         assert!(matches!(
             parse_line_bytes(b"socket connected", 0, 16),
             LineKind::Unmatched
         ));
+    }
+
+    #[test]
+    fn options_is_noise() {
+        let s = b"2026-07-24T00:00:10: \x1b[0mOPTIONS /api/x \x1b[32m204\x1b[0m 0.115 ms - 0\x1b[0m";
+        assert!(matches!(
+            parse_line_bytes(s, 0, s.len()),
+            LineKind::Empty | LineKind::Unmatched
+        ));
+    }
+
+    #[test]
+    fn socket_noise_is_skipped() {
+        let cases: &[&[u8]] = &[
+            b"2026-07-24T00:00:05: New Connection { address: '::ffff:127.0.0.1', id: 'abc' }",
+            b"2026-07-24T00:00:39: disconnected { id: 'abc', method: 'disconnect' }",
+            b"2026-07-24T00:01:29: join {",
+            b"  { 'abc': undefined }",
+            b"}",
+            b"] { CoNctv8nmitCu03iAAEW: undefined }",
+            b"] Length: 5",
+            b"2026-07-24T00:04:28: Token parts: [",
+            b"  address: '::ffff:127.0.0.1',",
+            b"  method: 'join'",
+        ];
+        for c in cases {
+            assert!(
+                matches!(parse_line_bytes(c, 0, c.len()), LineKind::Empty),
+                "expected Empty for {:?}",
+                String::from_utf8_lossy(c)
+            );
+        }
+        // Legit non-HTTP lines stay unmatched, not silently dropped.
+        let keep: &[&[u8]] = &[
+            b"Generated new NCD declaration for proposal PR-MOT-20261397003",
+            b"useOfVehicle 1 vehicleUsage 1",
+            b"customerReferenceNumber: 'QN/02/4030/2026/0715183'",
+        ];
+        for c in keep {
+            assert!(
+                matches!(parse_line_bytes(c, 0, c.len()), LineKind::Unmatched),
+                "expected Unmatched for {:?}",
+                String::from_utf8_lossy(c)
+            );
+        }
     }
 }
