@@ -1,21 +1,23 @@
-/**
- * Coordinator: persistent Wasm shards; merges compact endpoint partials only.
- */
-
 import {
   aggregateCron,
+  finalizeDailyStats,
   finalizeHourlyStats,
   finishApiFromPartials,
+  mergeDailyPartials,
   mergeHourlyPartials,
   type AggregatedResult,
   type AggPartial,
   type CronEventCompact,
+  type DaySummary,
   type LogSummary,
+  type NormalizeMode,
   type ParseOptions,
   EMPTY_RESULT,
 } from "../parser";
 import {
   decodeCronWire,
+  decodeDailyWire,
+  decodeDatesWire,
   decodeHourlyWire,
   decodePm2Partial,
   decodeUnmatchedWire,
@@ -76,6 +78,7 @@ export type ReaggPerfStages = {
 
 export type WorkerMessage =
   | { type: "PARSE_FILE"; payload: { file: File; options: ParseOptions } }
+  | { type: "PARSE_FILES"; payload: { files: File[]; options: ParseOptions } }
   | { type: "PARSE_TEXT"; payload: { text: string; options: ParseOptions } }
   | { type: "REAGGREGATE"; payload: { options: ParseOptions } }
   | { type: "CLEAR" }
@@ -111,6 +114,8 @@ let unmatchedCount = 0;
 let unmatchedSample: string[] = [];
 let cronEvents: CronEventCompact[] = [];
 let methods: string[] = [];
+let dates: string[] = [];
+let dailyStats: DaySummary[] = [];
 let activeShardCount = 0;
 let hourlyStats = finalizeHourlyStats(mergeHourlyPartials([]));
 let cachedSummary: { summary: LogSummary; methods: string[] } | null = null;
@@ -129,15 +134,8 @@ let lastParsePartial:
 let parseWallOrigin = 0;
 
 function poolSize(): number {
-  const hc =
-    typeof navigator !== "undefined" && navigator.hardwareConcurrency
-      ? navigator.hardwareConcurrency
-      : 4;
-  // Cap the shard pool: each worker holds its own Wasm linear memory, so the
-  // pool size multiplies per-worker RSS (~1 GB per shard for a 5 GiB corpus).
-  // 4 workers matches the pre-commit profile (~3 GB Chromium RSS peak) while
-  // still keeping 5 GiB parses near peak throughput.
-  return Math.max(2, Math.min(4, hc));
+  const hc = globalThis.navigator?.hardwareConcurrency ?? 4;
+  return Math.max(2, Math.min(5, hc));
 }
 
 function shardCountFor(fileSize: number): number {
@@ -151,6 +149,8 @@ function resetMeta() {
   unmatchedSample = [];
   cronEvents = [];
   methods = [];
+  dates = [];
+  dailyStats = [];
   activeShardCount = 0;
   hourlyStats = finalizeHourlyStats(mergeHourlyPartials([]));
   cachedSummary = null;
@@ -276,12 +276,20 @@ function absorbMeta(shards: ShardParsed[]) {
   cronEvents = [];
   let mask = 0;
   const hourlyPartials = [];
+  const allDates: string[] = [];
+  const dailyPartials = [];
   for (const s of shards) {
     hitCount += s.hitCount;
     unmatchedCount += s.unmatchedCount;
     mask |= s.methodsMask;
     hourlyPartials.push(decodeHourlyWire(new Uint8Array(s.hourlyWire)));
     cronEvents.push(...decodeCronWire(new Uint8Array(s.cronWire)));
+    if (s.datesWire) {
+      allDates.push(...decodeDatesWire(new Uint8Array(s.datesWire)));
+    }
+    if (s.dailyWire) {
+      dailyPartials.push(decodeDailyWire(new Uint8Array(s.dailyWire)));
+    }
     for (const line of decodeUnmatchedWire(new Uint8Array(s.unmatchedWire))) {
       if (unmatchedSample.length >= 40) break;
       unmatchedSample.push(line);
@@ -289,6 +297,8 @@ function absorbMeta(shards: ShardParsed[]) {
   }
   hourlyStats = finalizeHourlyStats(mergeHourlyPartials(hourlyPartials));
   methods = methodsFromMask(mask);
+  dates = Array.from(new Set(allDates)).sort();
+  dailyStats = finalizeDailyStats(mergeDailyPartials(dailyPartials));
   // Summary comes from first reagg (needSummary=true); warm reaggs reuse cache.
   cachedSummary = null;
 }
@@ -330,19 +340,15 @@ let prekickedPartials: {
 async function reaggregateShards(
   options: ParseOptions,
 ): Promise<{ result: AggregatedResult; timing: ReaggTiming }> {
-  // Summary is filter-independent; first reagg builds it, later runs reuse cache.
-  const needSummary = !cachedSummary?.summary;
+  const isDateFiltered = !!options.dateFilter && options.dateFilter !== "all";
+  // Summary is filter-independent unless date-filtered; first reagg builds it, later runs reuse cache.
+  const needSummary = !cachedSummary?.summary || isDateFiltered;
   if (activeShardCount === 0) {
     return {
       result: EMPTY_RESULT,
       timing: { shardReaggMaxMs: 0, decodePartialsMs: 0, finishApiMs: 0, totalMs: 0 },
     };
   }
-
-  self.postMessage({
-    type: "PROGRESS",
-    payload: { stage: "aggregating", processed: 0, total: 100, percent: 0 },
-  } satisfies WorkerResponse);
 
   const t0 = performance.now();
   let tasks: Promise<ShardPartial>[];
@@ -351,7 +357,8 @@ async function reaggregateShards(
     prekickedPartials.epoch === epoch &&
     prekickedPartials.options.normalizeMode === options.normalizeMode &&
     prekickedPartials.options.statusFamily === options.statusFamily &&
-    prekickedPartials.options.minMs === options.minMs
+    prekickedPartials.options.minMs === options.minMs &&
+    prekickedPartials.options.dateFilter === options.dateFilter
   ) {
     tasks = prekickedPartials.tasks;
     prekickedPartials = null;
@@ -366,6 +373,7 @@ async function reaggregateShards(
           normalizeMode: options.normalizeMode,
           statusFamily: options.statusFamily,
           minMs: options.minMs,
+          dateFilter: options.dateFilter,
           needSummary,
         }),
       );
@@ -378,29 +386,39 @@ async function reaggregateShards(
 
   const tDecode = performance.now();
   const partials: AggPartial[] = [];
+  let totalMatched = 0;
+  let totalUnmatched = 0;
   for (const w of wires) {
-    const { partial } = decodePm2Partial(new Uint8Array(w.partial));
+    const { matched, unmatched, partial } = decodePm2Partial(new Uint8Array(w.partial));
+    totalMatched += matched;
+    totalUnmatched += unmatched;
     partials.push(needSummary ? partial : { buckets: partial.buckets, summary: null });
   }
   const decodePartialsMs = performance.now() - tDecode;
 
   const tFinish = performance.now();
   const { api, summary: built } = finishApiFromPartials(partials, options, {
-    count: hitCount,
-    unmatchedCount,
+    count: totalMatched,
+    unmatchedCount: totalUnmatched,
   });
   const cron = aggregateCron(cronEvents, options);
-  const summary = cachedSummary?.summary ?? built!;
+  const summary = (isDateFiltered ? built : cachedSummary?.summary) ?? built!;
   const methodList = cachedSummary?.methods ?? methods;
 
   let starts = 0;
   let dones = 0;
   let fails = 0;
+  const dateFilter = isDateFiltered ? options.dateFilter! : null;
   for (const e of cronEvents) {
+    if (dateFilter && e.ts && !e.ts.startsWith(dateFilter)) continue;
     if (e.event === "start") starts++;
     else if (e.event === "done") dones++;
     else fails++;
   }
+
+  const activeHourlyStats = isDateFiltered
+    ? (dailyStats.find((d) => d.date === options.dateFilter)?.hourlyStats ?? hourlyStats)
+    : hourlyStats;
 
   const result: AggregatedResult = {
     api,
@@ -413,31 +431,38 @@ async function reaggregateShards(
       jobs: cron.length,
       slowestRun: cron.reduce((m, r) => Math.max(m, r.maxMs), 0),
     },
-    hourlyStats,
+    hourlyStats: activeHourlyStats,
     methods: methodList,
     unmatchedSample,
     unmatchedCount,
+    dates,
+    dailyStats,
   };
   const finishApiMs = performance.now() - tFinish;
   const totalMs = performance.now() - t0;
 
-  cachedSummary = { summary: result.summary, methods: result.methods };
+  if (!isDateFiltered) {
+    cachedSummary = { summary: result.summary, methods: result.methods };
+  }
   return {
     result,
     timing: { shardReaggMaxMs, decodePartialsMs, finishApiMs, totalMs },
   };
 }
 
-async function parseFileSharded(file: File, normalizeMode: string) {
+async function parseFilesSharded(input: File | File[], normalizeMode: NormalizeMode) {
+  const files = Array.isArray(input) ? input : [input];
+  // SAFETY: Blob satisfies the Blob/File slice and size interface consumed by parseBlobChunked.
+  const compositeFile = files.length === 1 ? files[0]! : (new Blob(files) as File);
   epoch++;
   const ep = epoch;
   resetMeta();
   parseWallOrigin = performance.now();
-  const n = shardCountFor(file.size);
+  const n = shardCountFor(compositeFile.size);
   const { wasmCompileMs, shardPoolInitMs } = await ensureShardPool();
   clearShards(ep);
 
-  const total = file.size || 1;
+  const total = compositeFile.size || 1;
   const lastProgress = { t: 0 };
   const PROGRESS_MS = 150;
 
@@ -458,13 +483,13 @@ async function parseFileSharded(file: File, normalizeMode: string) {
 
   const ranges: { start: number; end: number }[] = [];
   if (n === 1) {
-    ranges.push({ start: 0, end: file.size });
+    ranges.push({ start: 0, end: compositeFile.size });
   } else {
-    const chunk = Math.ceil(file.size / n);
+    const chunk = Math.ceil(compositeFile.size / n);
     for (let i = 0; i < n; i++) {
       const start = i * chunk;
-      const end = i === n - 1 ? file.size : Math.min(file.size, (i + 1) * chunk);
-      if (start >= file.size) break;
+      const end = i === n - 1 ? compositeFile.size : Math.min(compositeFile.size, (i + 1) * chunk);
+      if (start >= compositeFile.size) break;
       ranges.push({ start, end });
     }
   }
@@ -477,7 +502,7 @@ async function parseFileSharded(file: File, normalizeMode: string) {
   try {
     if (cancelled) throw new Error("Cancelled");
     const defaultOptions: ParseOptions = {
-      normalizeMode: normalizeMode as any,
+      normalizeMode,
       statusFamily: "all",
       minMs: 0,
       methodFilter: null,
@@ -490,13 +515,10 @@ async function parseFileSharded(file: File, normalizeMode: string) {
 
     const results = await Promise.all(
       ranges.map(async (r, i) => {
-        if (i > 0) {
-          await new Promise((resolve) => setTimeout(resolve, i * 4));
-        }
         const parsed = await runShardParsed(shardPool[i]!, {
           type: "PARSE_SHARD",
           epoch: ep,
-          file,
+          file: compositeFile,
           start: r.start,
           end: r.end,
           shardIndex: i,
@@ -549,7 +571,7 @@ async function parseFileSharded(file: File, normalizeMode: string) {
   }
 }
 
-async function parseText(text: string, normalizeMode: string) {
+async function parseText(text: string, normalizeMode: NormalizeMode) {
   epoch++;
   const ep = epoch;
   resetMeta();
@@ -614,8 +636,9 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 
     cancelled = false;
 
-    if (msg.type === "PARSE_FILE") {
-      await parseFileSharded(msg.payload.file, msg.payload.options.normalizeMode);
+    if (msg.type === "PARSE_FILE" || msg.type === "PARSE_FILES") {
+      const files = "files" in msg.payload ? msg.payload.files : [msg.payload.file];
+      await parseFilesSharded(files, msg.payload.options.normalizeMode);
       if (cancelled) throw new Error("Cancelled");
       const { result, timing } = await reaggregateShards(msg.payload.options);
       if (lastParsePartial) {
@@ -626,10 +649,9 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       }
       self.postMessage({ type: "RESULT", payload: result } satisfies WorkerResponse);
       const heapMB = lastParsePartial?.workerWasmHeapMB;
-      self.postMessage({
-        type: "DONE",
-        ...(heapMB != null ? { payload: { workerWasmHeapMB: heapMB } } : {}),
-      } satisfies WorkerResponse);
+      const doneResponse: WorkerResponse =
+        heapMB != null ? { type: "DONE", payload: { workerWasmHeapMB: heapMB } } : { type: "DONE" };
+      self.postMessage(doneResponse);
       return;
     }
 

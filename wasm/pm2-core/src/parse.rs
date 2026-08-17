@@ -45,6 +45,7 @@ pub enum LineKind {
         status: u16,
         duration_ms: f32,
         hour: Option<u8>,
+        date: Option<[u8; 10]>,
     },
     Cron {
         event: u8, // 0=start 1=done 2=fail
@@ -57,11 +58,12 @@ pub enum LineKind {
 
 const CRON_MARK: &[u8] = b"[cron]";
 
-#[inline]
+#[inline(always)]
 fn is_digit(c: u8) -> bool {
     c.is_ascii_digit()
 }
 
+#[inline(always)]
 fn skip_ansi(buf: &[u8], mut i: usize, end: usize) -> usize {
     while i + 1 < end && buf[i] == 0x1b && buf[i + 1] == b'[' {
         i += 2;
@@ -76,26 +78,46 @@ fn skip_ansi(buf: &[u8], mut i: usize, end: usize) -> usize {
     i
 }
 
+#[inline(always)]
 fn skip_space_ansi(buf: &[u8], mut i: usize, end: usize) -> usize {
-    loop {
-        i = skip_ansi(buf, i, end);
-        if i >= end {
-            return i;
-        }
+    while i < end {
         let c = buf[i];
         if c == b' ' || c == b'\t' {
             i += 1;
             continue;
         }
-        return i;
+        if c == 0x1b && i + 1 < end && buf[i + 1] == b'[' {
+            i = skip_ansi(buf, i, end);
+            continue;
+        }
+        break;
     }
+    i
 }
 
+#[inline(always)]
 fn only_space_ansi_left(buf: &[u8], i: usize, end: usize) -> bool {
     skip_space_ansi(buf, i, end) >= end
 }
 
-fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<(usize, usize, usize, u8)> {
+#[inline(always)]
+fn is_digits_4(b: &[u8]) -> bool {
+    let u = u32::from_le_bytes(b[..4].try_into().unwrap());
+    let a = u.wrapping_add(0x4646_4646);
+    let b = u.wrapping_sub(0x3030_3030);
+    ((a | b) & 0x8080_8080) == 0
+}
+
+#[inline(always)]
+fn is_digits_2(b: &[u8]) -> bool {
+    let u = u16::from_le_bytes(b[..2].try_into().unwrap());
+    let a = u.wrapping_add(0x4646);
+    let b = u.wrapping_sub(0x3030);
+    ((a | b) & 0x8080) == 0
+}
+
+#[inline]
+fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<(usize, usize, usize, u8, [u8; 10])> {
     if end - start < 20 {
         return None;
     }
@@ -108,63 +130,121 @@ fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<(usize, usize,
     if sep != b'T' && sep != b' ' {
         return None;
     }
-    if !is_digit(b[0]) || !is_digit(b[1]) || !is_digit(b[2]) || !is_digit(b[3])
-        || !is_digit(b[5]) || !is_digit(b[6]) || !is_digit(b[8]) || !is_digit(b[9])
-        || !is_digit(b[11]) || !is_digit(b[12]) || !is_digit(b[14]) || !is_digit(b[15])
-        || !is_digit(b[17]) || !is_digit(b[18])
+    if !is_digits_4(&b[0..4])
+        || !is_digits_2(&b[5..7])
+        || !is_digits_2(&b[8..10])
+        || !is_digits_2(&b[11..13])
+        || !is_digits_2(&b[14..16])
+        || !is_digits_2(&b[17..19])
     {
         return None;
     }
     let hour = (b[11] - b'0') * 10 + (b[12] - b'0');
-    Some((skip_space_ansi(buf, a + 20, end), a, a + 19, hour))
+    let mut date = [0u8; 10];
+    date.copy_from_slice(&b[0..10]);
+    Some((skip_space_ansi(buf, a + 20, end), a, a + 19, hour, date))
 }
 
+#[inline(always)]
 fn parse_method(buf: &[u8], mut i: usize, end: usize) -> Option<(Method, usize)> {
     i = skip_space_ansi(buf, i, end);
-    // Frequency order for this corpus (GET/POST dominate; OPTIONS is dropped as noise).
-    const METHODS: &[(Method, &[u8])] = &[
-        (Method::Get, b"GET"),
-        (Method::Post, b"POST"),
-        (Method::Put, b"PUT"),
-        (Method::Patch, b"PATCH"),
-        (Method::Head, b"HEAD"),
-        (Method::Delete, b"DELETE"),
-    ];
-    for &(method, bytes) in METHODS {
-        if i + bytes.len() > end {
-            continue;
+    if i >= end {
+        return None;
+    }
+    // Fast path: method + space delimiter
+    if i + 4 <= end && &buf[i..i + 4] == b"GET " {
+        return Some((Method::Get, i + 4));
+    }
+    if i + 5 <= end && &buf[i..i + 5] == b"POST " {
+        return Some((Method::Post, i + 5));
+    }
+    if i + 4 <= end && &buf[i..i + 4] == b"PUT " {
+        return Some((Method::Put, i + 4));
+    }
+    if i + 6 <= end && &buf[i..i + 6] == b"PATCH " {
+        return Some((Method::Patch, i + 6));
+    }
+    if i + 7 <= end && &buf[i..i + 7] == b"DELETE " {
+        return Some((Method::Delete, i + 7));
+    }
+    if i + 5 <= end && &buf[i..i + 5] == b"HEAD " {
+        return Some((Method::Head, i + 5));
+    }
+
+    let (m, len) = match buf[i] {
+        b'G' => {
+            if i + 3 <= end && &buf[i..i + 3] == b"GET" {
+                (Method::Get, 3)
+            } else {
+                return None;
+            }
         }
-        if &buf[i..i + bytes.len()] != bytes {
-            continue;
+        b'P' => {
+            if i + 4 <= end && &buf[i..i + 4] == b"POST" {
+                (Method::Post, 4)
+            } else if i + 5 <= end && &buf[i..i + 5] == b"PATCH" {
+                (Method::Patch, 5)
+            } else if i + 3 <= end && &buf[i..i + 3] == b"PUT" {
+                (Method::Put, 3)
+            } else {
+                return None;
+            }
         }
-        let after = i + bytes.len();
-        let next = if after < end { buf[after] } else { b' ' };
-        if next == b' ' || next == b'\t' || next == 0x1b || after >= end {
-            return Some((method, after));
+        b'D' => {
+            if i + 6 <= end && &buf[i..i + 6] == b"DELETE" {
+                (Method::Delete, 6)
+            } else {
+                return None;
+            }
+        }
+        b'H' => {
+            if i + 4 <= end && &buf[i..i + 4] == b"HEAD" {
+                (Method::Head, 4)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let after = i + len;
+    if after < end {
+        let next = buf[after];
+        if next != b' ' && next != b'\t' && next != 0x1b {
+            return None;
         }
     }
-    None
+    Some((m, after))
 }
 
-#[inline]
+#[inline(always)]
 fn read_token(buf: &[u8], mut i: usize, end: usize) -> Option<(usize, usize, usize)> {
     i = skip_space_ansi(buf, i, end);
     if i >= end {
         return None;
     }
     let start = i;
-    if let Some(rel) = memchr::memchr3(b' ', b'\t', 0x1b, &buf[i..end]) {
-        let tok_end = i + rel;
-        if tok_end == start {
-            return None;
-        }
-        Some((start, tok_end, tok_end))
-    } else {
-        Some((start, end, end))
+    let tok_len = memchr::memchr3(b' ', b'\t', 0x1b, &buf[start..end]).unwrap_or(end - start);
+    if tok_len == 0 {
+        return None;
     }
+    let token_end = start + tok_len;
+    Some((start, token_end, token_end))
 }
 
-#[inline]
+const INV_POW10: [f32; 10] = [
+    1.0,
+    0.1,
+    0.01,
+    0.001,
+    0.0001,
+    0.00001,
+    0.000001,
+    0.0000001,
+    0.00000001,
+    0.000000001,
+];
+
+#[inline(always)]
 fn parse_float(buf: &[u8], mut i: usize, end: usize) -> Option<(f32, usize)> {
     i = skip_space_ansi(buf, i, end);
     if i >= end || (!is_digit(buf[i]) && buf[i] != b'.') {
@@ -180,16 +260,21 @@ fn parse_float(buf: &[u8], mut i: usize, end: usize) -> Option<(f32, usize)> {
         i += 1;
         let frac_start = i;
         let mut frac_val: u32 = 0;
-        let mut div: f32 = 1.0;
+        let mut frac_digits: usize = 0;
         while i < end && is_digit(buf[i]) {
             frac_val = frac_val * 10 + (buf[i] - b'0') as u32;
-            div *= 10.0;
+            frac_digits += 1;
             i += 1;
         }
         if i == start || (i == frac_start && frac_start == start + 1) {
             return None;
         }
-        let val = (int_val as f32) + (frac_val as f32) / div;
+        let mult = if frac_digits < INV_POW10.len() {
+            INV_POW10[frac_digits]
+        } else {
+            10.0f32.powi(-(frac_digits as i32))
+        };
+        let val = (int_val as f32) + (frac_val as f32) * mult;
         Some((val, i))
     } else {
         if i == start {
@@ -217,7 +302,7 @@ fn has_non_space(buf: &[u8], start: usize, end: usize) -> bool {
         if c > 32 && c != 0x1b {
             return true;
         }
-        if c == 0x1b {
+        if c == 0x1b && i + 1 < end && buf[i + 1] == b'[' {
             i = skip_ansi(buf, i, end);
             continue;
         }
@@ -229,7 +314,7 @@ fn has_non_space(buf: &[u8], start: usize, end: usize) -> bool {
 /// Line content after the optional PM2 timestamp + leading whitespace.
 fn noise_body<'a>(buf: &'a [u8], start: usize, end: usize) -> &'a [u8] {
     let mut i = skip_space_ansi(buf, start, end);
-    if let Some((ni, _, _, _)) = skip_timestamp(buf, i, end) {
+    if let Some((ni, _, _, _, _)) = skip_timestamp(buf, i, end) {
         if ni != i {
             i = ni;
         }
@@ -325,40 +410,51 @@ fn strip_ansi_bytes(buf: &[u8]) -> Vec<u8> {
 
 fn try_http_a(buf: &[u8], start: usize, end: usize) -> Option<LineKind> {
     let mut i = skip_space_ansi(buf, start, end);
-    let hour = if let Some((ni, _, _, hour)) = skip_timestamp(buf, i, end) {
+    let (hour, date) = if let Some((ni, _, _, hour, date_bytes)) = skip_timestamp(buf, i, end) {
         if ni != i {
             i = ni;
         }
-        (hour < 24).then_some(hour)
+        ((hour < 24).then_some(hour), Some(date_bytes))
     } else {
-        None
+        (None, None)
     };
     let (method, ni) = parse_method(buf, i, end)?;
     i = ni;
     let (ps, pe, ni) = read_token(buf, i, end)?;
-    i = ni;
-    let (ss, se, ni) = read_token(buf, i, end)?;
-    if se - ss != 3 {
+    i = skip_space_ansi(buf, ni, end);
+    if i + 3 > end {
         return None;
     }
-    let s0 = buf[ss];
-    let s1 = buf[ss + 1];
-    let s2 = buf[ss + 2];
+    let s0 = buf[i];
+    let s1 = buf[i + 1];
+    let s2 = buf[i + 2];
     if !is_digit(s0) || !is_digit(s1) || !is_digit(s2) {
         return None;
     }
+    let after_status = i + 3;
+    if after_status < end {
+        let n = buf[after_status];
+        if n != b' ' && n != b'\t' && n != 0x1b {
+            return None;
+        }
+    }
     let status = ((s0 - b'0') as u16) * 100 + ((s1 - b'0') as u16) * 10 + ((s2 - b'0') as u16);
-    i = ni;
+    i = after_status;
     let (dur, ni) = parse_float(buf, i, end)?;
-    i = skip_space_ansi(buf, ni, end);
-    if i + 1 >= end || buf[i] != b'm' || buf[i + 1] != b's' {
-        return None;
+    // Fast path: " ms - " is standard PM2 HTTP log format
+    if ni + 6 <= end && &buf[ni..ni + 6] == b" ms - " {
+        i = ni + 6;
+    } else {
+        i = skip_space_ansi(buf, ni, end);
+        if i + 1 >= end || buf[i] != b'm' || buf[i + 1] != b's' {
+            return None;
+        }
+        i = skip_space_ansi(buf, i + 2, end);
+        if i >= end || buf[i] != b'-' {
+            return None;
+        }
+        i = skip_space_ansi(buf, i + 1, end);
     }
-    i = skip_space_ansi(buf, i + 2, end);
-    if i >= end || buf[i] != b'-' {
-        return None;
-    }
-    i = skip_space_ansi(buf, i + 1, end);
     if i >= end {
         return None;
     }
@@ -383,6 +479,7 @@ fn try_http_a(buf: &[u8], start: usize, end: usize) -> Option<LineKind> {
         status,
         duration_ms: dur,
         hour,
+        date,
     })
 }
 
@@ -407,13 +504,14 @@ fn try_http_b(buf: &[u8], start: usize, end: usize) -> Option<LineKind> {
         status: 0,
         duration_ms: dur,
         hour: None,
+        date: None,
     })
 }
 
 fn try_cron(buf: &[u8], start: usize, end: usize) -> Option<LineKind> {
     let mut i = skip_space_ansi(buf, start, end);
     let ts = skip_timestamp(buf, i, end);
-    if let Some((ni, _, _, _)) = ts {
+    if let Some((ni, _, _, _, _)) = ts {
         i = ni;
     }
     let cron_idx = find_cron_mark(buf, i, end)?;
@@ -491,7 +589,7 @@ fn try_cron(buf: &[u8], start: usize, end: usize) -> Option<LineKind> {
             }
         }
     }
-    let ts_bytes = ts.map(|(_, a, b, _)| buf[a..b].to_vec());
+    let ts_bytes = ts.map(|(_, a, b, _, _)| buf[a..b].to_vec());
     Some(LineKind::Cron {
         event,
         name,
@@ -508,22 +606,9 @@ pub fn parse_line_bytes(buf: &[u8], start: usize, mut end: usize) -> LineKind {
     if start >= end {
         return LineKind::Empty;
     }
-    // First non-space/ANSI byte gates the pattern probes. httpA needs a
-    // method letter (G/P/H/D) or a digit (timestamp first); httpB needs a
-    // digit (duration first); cron needs '['. Skipping failed probes for the
-    // ~67% non-httpA lines is the cheapest parse win available.
-    let mut gate = start;
-    loop {
-        gate = skip_ansi(buf, gate, end);
-        if gate >= end {
-            return LineKind::Empty;
-        }
-        let c = buf[gate];
-        if c == b' ' || c == b'\t' {
-            gate += 1;
-            continue;
-        }
-        break;
+    let gate = skip_space_ansi(buf, start, end);
+    if gate >= end {
+        return LineKind::Empty;
     }
     let g = buf[gate];
     let method_start = matches!(g, b'G' | b'P' | b'H' | b'D');
@@ -579,12 +664,14 @@ mod tests {
                 status,
                 duration_ms,
                 hour,
+                date,
             } => {
                 assert_eq!(method, Method::Get);
                 assert_eq!(&s[path_start..path_end], b"/api/health");
                 assert_eq!(status, 200);
                 assert!((duration_ms - 12.5).abs() < 0.01);
                 assert_eq!(hour, Some(0));
+                assert_eq!(date, Some(*b"2026-07-24"));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -601,12 +688,14 @@ mod tests {
                 status,
                 duration_ms,
                 hour,
+                date,
             } => {
                 assert_eq!(method, Method::Post);
                 assert_eq!(&s[path_start..path_end], b"/api/admin/dashboard/dashboarddata");
                 assert_eq!(status, 200);
                 assert!((duration_ms - 71.197).abs() < 0.01);
                 assert_eq!(hour, None);
+                assert_eq!(date, None);
             }
             other => panic!("unexpected {other:?}"),
         }

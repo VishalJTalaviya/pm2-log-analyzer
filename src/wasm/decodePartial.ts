@@ -1,6 +1,9 @@
-/** Decode Rust PM2P reagg partials and cron/unmatched wires. */
-
-import type { AggPartial, HourlyPartial, NormBucketWire } from "../parser/aggregate";
+import type {
+  AggPartial,
+  HourlyBucketPartial,
+  HourlyPartial,
+  NormBucketWire,
+} from "../parser/aggregate";
 import type { CronEventCompact, LogMethod } from "../parser";
 import type { RelHistWire } from "../parser/relHist";
 import { METHODS } from "../parser";
@@ -17,30 +20,34 @@ function f64(view: DataView, o: number): number {
   return view.getFloat64(o, true);
 }
 
-function readBytes(
-  buf: Uint8Array,
-  view: DataView,
-  o: number,
-): { bytes: Uint8Array; next: number } {
+type ReadBytesResult = {
+  bytes: Uint8Array;
+  next: number;
+};
+
+function readBytes(buf: Uint8Array, view: DataView, o: number): ReadBytesResult {
   const len = u32(view, o);
   o += 4;
   return { bytes: buf.subarray(o, o + len), next: o + len };
 }
 
-function decodeSketch(buf: Uint8Array): RelHistWire {
-  if (buf.length < 8) return { buckets: [], count: 0 };
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const count = u32(view, 0);
-  const n = u32(view, 4);
+type DecodedSketch = {
+  sketch: RelHistWire;
+  next: number;
+};
+
+function decodeSketchAt(view: DataView, o: number): DecodedSketch {
+  const count = u32(view, o);
+  const n = u32(view, 4 + o);
   const buckets: [number, number][] = [];
-  let o = 8;
+  let cur = o + 8;
   for (let i = 0; i < n; i++) {
-    const k = view.getInt32(o, true);
-    const c = u32(view, o + 4);
+    const k = view.getInt32(cur, true);
+    const c = u32(view, cur + 4);
     buckets.push([k, c]);
-    o += 8;
+    cur += 8;
   }
-  return { buckets, count };
+  return { sketch: { buckets, count }, next: cur };
 }
 
 const HOURLY_MAGIC = 0x504d3248;
@@ -53,17 +60,16 @@ export function decodeHourlyWire(buf: Uint8Array): HourlyPartial {
   const bucketCount = view.getUint16(6, true);
   if (bucketCount !== 24) throw new Error(`unsupported PM2H bucket count ${bucketCount}`);
 
-  const buckets: HourlyPartial["buckets"] = [];
+  const buckets: HourlyBucketPartial[] = [];
   let o = 8;
   for (let i = 0; i < bucketCount; i++) {
     const count = u32(view, o);
     const errorCount = u32(view, o + 4);
     const sum = f64(view, o + 8);
     const max = f32(view, o + 16);
-    const sketchLength = u32(view, o + 20);
     o += 24;
-    const sketch = decodeSketch(buf.subarray(o, o + sketchLength));
-    o += sketchLength;
+    const { sketch, next } = decodeSketchAt(view, o);
+    o = next;
     buckets.push({ count, errorCount, sum, max, sketch });
   }
   if (o !== buf.byteLength) throw new Error("trailing PM2H bytes");
@@ -72,11 +78,13 @@ export function decodeHourlyWire(buf: Uint8Array): HourlyPartial {
 
 const dec = new TextDecoder();
 
-export function decodePm2Partial(buf: Uint8Array): {
+export type DecodedPm2Partial = {
   matched: number;
   unmatched: number;
   partial: AggPartial;
-} {
+};
+
+export function decodePm2Partial(buf: Uint8Array): DecodedPm2Partial {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   let o = 0;
   if (u32(view, o) !== MAGIC) throw new Error("bad PM2P magic");
@@ -104,10 +112,9 @@ export function decodePm2Partial(buf: Uint8Array): {
     o += 4;
     const slow = u32(view, o);
     o += 4;
-    const skLen = u32(view, o);
-    o += 4;
-    const sketch = decodeSketch(buf.subarray(o, o + skLen));
-    o += skLen;
+    o += 4; // skLen
+    const { sketch, next } = decodeSketchAt(view, o);
+    o = next;
     summary = { sum, max, errors, slow, sketch };
   }
 
@@ -127,11 +134,10 @@ export function decodePm2Partial(buf: Uint8Array): {
     o += 4;
     const pathRead = readBytes(buf, view, o);
     o = pathRead.next;
-    const skLen = u32(view, o);
-    o += 4;
-    const sketch = decodeSketch(buf.subarray(o, o + skLen));
-    o += skLen;
-    const method = (METHODS[methodCode] ?? "GET") as LogMethod;
+    o += 4; // skLen
+    const { sketch, next } = decodeSketchAt(view, o);
+    o = next;
+    const method = METHODS[methodCode] ?? "GET";
     const path = dec.decode(pathRead.bytes);
     buckets.push({
       method,
@@ -195,6 +201,78 @@ export function decodeUnmatchedWire(buf: Uint8Array): string[] {
     out.push(dec.decode(r.bytes));
   }
   return out;
+}
+
+export const DAILY_MAGIC = 0x504d3244; // PM2D
+
+export type DailyBucketPartial = {
+  date: string;
+  count: number;
+  errorCount: number;
+  slowCount: number;
+  sum: number;
+  max: number;
+  sketch: RelHistWire;
+  hourly: HourlyBucketPartial[];
+};
+
+export type DailyPartial = {
+  days: DailyBucketPartial[];
+};
+
+export function decodeDatesWire(buf: Uint8Array): string[] {
+  if (buf.byteLength < 4) return [];
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const count = u32(view, 0);
+  let o = 4;
+  const dates: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const r = readBytes(buf, view, o);
+    o = r.next;
+    dates.push(dec.decode(r.bytes));
+  }
+  return dates;
+}
+
+export function decodeDailyWire(buf: Uint8Array): DailyPartial {
+  if (buf.byteLength === 0) return { days: [] };
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (buf.byteLength < 8 || u32(view, 0) !== DAILY_MAGIC) throw new Error("bad PM2D magic");
+  const version = view.getUint16(4, true);
+  if (version !== 1) throw new Error(`unsupported PM2D version ${version}`);
+  const dayCount = view.getUint16(6, true);
+
+  const days: DailyBucketPartial[] = [];
+  let o = 8;
+  for (let i = 0; i < dayCount; i++) {
+    const dateBytes = buf.subarray(o, o + 10);
+    const date = dec.decode(dateBytes);
+    o += 12; // 10 bytes date + 2 bytes pad
+    const count = u32(view, o);
+    const errorCount = u32(view, o + 4);
+    const slowCount = u32(view, o + 8);
+    const sum = f64(view, o + 12);
+    const max = f32(view, o + 20);
+    o += 28; // 24 + 4 for skLen
+    const { sketch, next } = decodeSketchAt(view, o);
+    o = next;
+
+    const hourly: HourlyBucketPartial[] = [];
+    for (let h = 0; h < 24; h++) {
+      const hCount = u32(view, o);
+      const hError = u32(view, o + 4);
+      const hSum = f64(view, o + 8);
+      const hMax = f32(view, o + 16);
+      o += 24; // 20 + 4 for hSkLen
+      const { sketch: hSketch, next: hNext } = decodeSketchAt(view, o);
+      o = hNext;
+      hourly.push({ count: hCount, errorCount: hError, sum: hSum, max: hMax, sketch: hSketch });
+    }
+
+    days.push({ date, count, errorCount, slowCount, sum, max, sketch, hourly });
+  }
+
+  return { days };
 }
 
 export function methodsFromMask(mask: number): LogMethod[] {

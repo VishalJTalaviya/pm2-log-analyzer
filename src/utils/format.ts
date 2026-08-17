@@ -13,5 +13,11 @@ export function formatBytes(bytes: number): string {
   const k = 1024;
   const sizes = ["B", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+  return `${Number.parseFloat((bytes / k ** i).toFixed(1))} ${sizes[i]}`;
+}
+
+export function formatDate(date?: string): string {
+  if (!date) return "";
+  const [y, m, d] = date.split("-");
+  return y && m && d ? new Date(+y, +m - 1, +d).toLocaleDateString() : date;
 }

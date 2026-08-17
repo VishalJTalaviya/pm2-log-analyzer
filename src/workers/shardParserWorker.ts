@@ -37,6 +37,7 @@ export type ShardRequest =
       normalizeMode: string;
       statusFamily: string;
       minMs: number;
+      dateFilter?: string | null | undefined;
       needSummary: boolean;
     };
 
@@ -61,6 +62,8 @@ export type ShardParsed = {
   cronWire: ArrayBuffer;
   unmatchedWire: ArrayBuffer;
   hourlyWire: ArrayBuffer;
+  datesWire: ArrayBuffer;
+  dailyWire: ArrayBuffer;
   partialWire?: ArrayBuffer;
   /** Debug probe: current Wasm linear memory size. */
   wasmHeapBytes?: number;
@@ -88,23 +91,19 @@ export type ShardReady = { type: "SHARD_READY" };
 
 export type ShardModeReady = { type: "SHARD_MODE_READY"; epoch: number };
 
-const CHUNK = 16 * 1024 * 1024;
+const CHUNK = 32 * 1024 * 1024;
 const LINE_EXTEND = 256 * 1024;
 
 let engine: Pm2Engine | null = null;
 let wasmMemory: WebAssembly.Memory | null = null;
 let ready = false;
 
-function heapU8(): Uint8Array {
-  return new Uint8Array(wasmMemory!.buffer);
-}
-
 /** Write bytes into Wasm ingest window; return length written. */
 function writeIngest(src: Uint8Array): number {
   const len = src.length;
   const ptr = engine!.ingest_ptr(len);
   // Re-read heap after possible grow from ingest_ptr.
-  heapU8().set(src, ptr);
+  new Uint8Array(wasmMemory!.buffer).set(src, ptr);
   return len;
 }
 
@@ -125,8 +124,8 @@ async function parseFileRange(file: File, start: number, end: number): Promise<S
   const readEnd = Math.min(file.size, end + LINE_EXTEND);
   let off = start;
 
-  // Pipelined multi-buffered prefetch queue (depth 2) into Wasm ingest window
-  const QUEUE_DEPTH = 2;
+  // Pipelined multi-buffered prefetch queue (depth 3) into Wasm ingest window
+  const QUEUE_DEPTH = 3;
   const pendingReads: Promise<{ chunk: Uint8Array; readTime: number }>[] = [];
 
   const enqueue = (chunkOff: number) => {
@@ -188,25 +187,54 @@ async function parseFileRange(file: File, start: number, end: number): Promise<S
   };
 }
 
-function metaBuffers(): {
+export type ShardResponse = ShardReady | ShardModeReady | ShardParsed | ShardPartial | ShardError;
+
+interface WorkerGlobal {
+  postMessage(message: ShardResponse, transfer?: Transferable[]): void;
+  onmessage: ((e: MessageEvent<ShardRequest>) => Promise<void> | void) | null;
+}
+declare const self: WorkerGlobal;
+
+type ShardMetaBuffers = {
   cronWire: ArrayBuffer;
   unmatchedWire: ArrayBuffer;
   hourlyWire: ArrayBuffer;
-} {
+  datesWire: ArrayBuffer;
+  dailyWire: ArrayBuffer;
+};
+
+function metaBuffers(): ShardMetaBuffers {
   const cron = engine!.cron_wire();
   const unmatched = engine!.unmatched_sample_wire();
   const hourly = engine!.hourly_wire();
-  return {
-    cronWire: cron.buffer.slice(cron.byteOffset, cron.byteOffset + cron.byteLength) as ArrayBuffer,
-    unmatchedWire: unmatched.buffer.slice(
-      unmatched.byteOffset,
-      unmatched.byteOffset + unmatched.byteLength,
-    ) as ArrayBuffer,
-    hourlyWire: hourly.buffer.slice(
-      hourly.byteOffset,
-      hourly.byteOffset + hourly.byteLength,
-    ) as ArrayBuffer,
-  };
+  const dates = engine!.dates_wire();
+  const daily = engine!.daily_wire();
+  // SAFETY: Memory slice produces an isolated ArrayBuffer for postMessage transfer.
+  const cronWire = cron.buffer.slice(
+    cron.byteOffset,
+    cron.byteOffset + cron.byteLength,
+  ) as ArrayBuffer;
+  // SAFETY: Memory slice produces an isolated ArrayBuffer for postMessage transfer.
+  const unmatchedWire = unmatched.buffer.slice(
+    unmatched.byteOffset,
+    unmatched.byteOffset + unmatched.byteLength,
+  ) as ArrayBuffer;
+  // SAFETY: Memory slice produces an isolated ArrayBuffer for postMessage transfer.
+  const hourlyWire = hourly.buffer.slice(
+    hourly.byteOffset,
+    hourly.byteOffset + hourly.byteLength,
+  ) as ArrayBuffer;
+  // SAFETY: Memory slice produces an isolated ArrayBuffer for postMessage transfer.
+  const datesWire = dates.buffer.slice(
+    dates.byteOffset,
+    dates.byteOffset + dates.byteLength,
+  ) as ArrayBuffer;
+  // SAFETY: Memory slice produces an isolated ArrayBuffer for postMessage transfer.
+  const dailyWire = daily.buffer.slice(
+    daily.byteOffset,
+    daily.byteOffset + daily.byteLength,
+  ) as ArrayBuffer;
+  return { cronWire, unmatchedWire, hourlyWire, datesWire, dailyWire };
 }
 
 self.onmessage = async (e: MessageEvent<ShardRequest>) => {
@@ -238,13 +266,14 @@ self.onmessage = async (e: MessageEvent<ShardRequest>) => {
       const timing = await parseFileRange(file, start, end);
       const modeCode = normalizeModeCode(normalizeMode ?? "collapseIds");
       engine.ensure_mode(modeCode);
-      const partialWireU8 = engine.reaggregate(modeCode, 0, 0, true);
+      const partialWireU8 = engine.reaggregate(modeCode, 0, 0, new Uint8Array(), true);
+      // SAFETY: Memory slice produces an isolated ArrayBuffer for postMessage transfer.
       const partialWire = partialWireU8.buffer.slice(
         partialWireU8.byteOffset,
         partialWireU8.byteOffset + partialWireU8.byteLength,
       ) as ArrayBuffer;
       const tMeta = performance.now();
-      const { cronWire, unmatchedWire, hourlyWire } = metaBuffers();
+      const { cronWire, unmatchedWire, hourlyWire, datesWire, dailyWire } = metaBuffers();
       timing.metaWireMs = performance.now() - tMeta;
       timing.shardWallMs =
         timing.readMs + timing.copyIngestMs + timing.feedMs + timing.endShardMs + timing.metaWireMs;
@@ -258,15 +287,19 @@ self.onmessage = async (e: MessageEvent<ShardRequest>) => {
         cronWire,
         unmatchedWire,
         hourlyWire,
+        datesWire,
+        dailyWire,
         partialWire,
         wasmHeapBytes: wasmMemory!.buffer.byteLength,
         pathCount: engine.path_count(),
         timing,
       };
-      (self as unknown as Worker).postMessage(result, [
+      self.postMessage(result, [
         cronWire,
         unmatchedWire,
         hourlyWire,
+        datesWire,
+        dailyWire,
         partialWire,
       ]);
       return;
@@ -294,7 +327,7 @@ self.onmessage = async (e: MessageEvent<ShardRequest>) => {
       engine.end_shard();
       const endShardMs = performance.now() - tEnd;
       const tMeta = performance.now();
-      const { cronWire, unmatchedWire, hourlyWire } = metaBuffers();
+      const { cronWire, unmatchedWire, hourlyWire, datesWire, dailyWire } = metaBuffers();
       const metaWireMs = performance.now() - tMeta;
       const timing: ShardTiming = {
         readMs: 0,
@@ -314,26 +347,34 @@ self.onmessage = async (e: MessageEvent<ShardRequest>) => {
         cronWire,
         unmatchedWire,
         hourlyWire,
+        datesWire,
+        dailyWire,
         timing,
       };
-      (self as unknown as Worker).postMessage(result, [cronWire, unmatchedWire, hourlyWire]);
+      self.postMessage(result, [cronWire, unmatchedWire, hourlyWire, datesWire, dailyWire]);
       return;
     }
 
     if (msg.type === "REAGGREGATE") {
       const t0 = performance.now();
+      const dateFilterBytes =
+        msg.dateFilter && msg.dateFilter !== "all"
+          ? new TextEncoder().encode(msg.dateFilter)
+          : new Uint8Array();
       const partial = engine.reaggregate(
         normalizeModeCode(msg.normalizeMode),
         statusFamilyCode(msg.statusFamily),
         msg.minMs,
+        dateFilterBytes,
         msg.needSummary,
       );
       const reaggMs = performance.now() - t0;
+      // SAFETY: Memory slice produces an isolated ArrayBuffer for postMessage transfer.
       const ab = partial.buffer.slice(
         partial.byteOffset,
         partial.byteOffset + partial.byteLength,
       ) as ArrayBuffer;
-      (self as unknown as Worker).postMessage(
+      self.postMessage(
         {
           type: "SHARD_PARTIAL",
           shardIndex: msg.shardIndex,
@@ -346,8 +387,8 @@ self.onmessage = async (e: MessageEvent<ShardRequest>) => {
       return;
     }
   } catch (err) {
-    const shardIndex = "shardIndex" in msg ? (msg as { shardIndex: number }).shardIndex : 0;
-    const epoch = "epoch" in msg ? (msg as { epoch: number }).epoch : 0;
+    const shardIndex = "shardIndex" in msg ? msg.shardIndex : 0;
+    const epoch = "epoch" in msg ? msg.epoch : 0;
     self.postMessage({
       type: "SHARD_ERROR",
       shardIndex,

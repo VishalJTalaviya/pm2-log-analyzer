@@ -1,16 +1,20 @@
+import { useShallow } from "zustand/react/shallow";
 import { useAnalysisStore } from "../store/analysisStore";
 import { formatMs, formatNum } from "../utils/format";
 
 export function KpiRow() {
-  const summary = useAnalysisStore((s) => s.result?.summary);
-  const cronJobs = useAnalysisStore((s) => s.result?.cronSummary.jobs ?? 0);
-  const hasCronEvents = useAnalysisStore((s) => {
-    const c = s.result?.cronSummary;
-    return !!c && c.starts + c.dones + c.fails > 0;
-  });
-  const hasData = useAnalysisStore((s) => s.hasData);
+  const { summary, cronJobs, hasCronEvents } = useAnalysisStore(
+    useShallow((s) => {
+      const c = s.result?.cronSummary;
+      return {
+        summary: s.result?.summary,
+        cronJobs: c?.jobs ?? 0,
+        hasCronEvents: !!c && c.starts + c.dones + c.fails > 0,
+      };
+    }),
+  );
 
-  if (!hasData || !summary) return null;
+  if (!summary) return null;
 
   const items: { label: string; value: string; accent?: boolean; danger?: boolean }[] = [
     { label: "Requests", value: formatNum(summary.matched) },
@@ -19,12 +23,15 @@ export function KpiRow() {
     { label: "Errors", value: formatNum(summary.errors), danger: summary.errors > 0 },
     { label: "Slow ≥3s", value: formatNum(summary.slow) },
   ];
-  if (hasCronEvents) items.push({ label: "Cron jobs", value: formatNum(cronJobs) });
+
+  if (hasCronEvents) {
+    items.push({ label: "Cron jobs", value: formatNum(cronJobs) });
+  }
 
   return (
     <section
       data-testid="kpi-row"
-      className="grid grid-cols-2 gap-px overflow-hidden rounded border border-slate-200 bg-slate-200 sm:grid-cols-3 dark:border-slate-800 dark:bg-slate-800 lg:grid-cols-6"
+      className="grid grid-cols-2 gap-px overflow-hidden rounded border border-slate-200 bg-slate-200 sm:grid-cols-3 dark:border-slate-800 dark:bg-slate-800 lg:grid-flow-col lg:auto-cols-fr"
     >
       {items.map((item) => (
         <div key={item.label} className="bg-white px-3 py-3 dark:bg-slate-900">

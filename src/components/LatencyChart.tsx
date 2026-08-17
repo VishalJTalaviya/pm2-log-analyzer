@@ -13,24 +13,24 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { AggregatedEndpoint, HourlyBucket } from "../parser";
-import { formatMs, formatNum } from "../utils/format";
-import { Activity, BarChart3, Clock, Flame } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
+import type { AggregatedEndpoint } from "../parser";
+import { formatDate, formatMs, formatNum } from "../utils/format";
+import { Activity, BarChart3, CalendarDays, Clock, Flame } from "lucide-react";
+import { EMPTY_DAILY, EMPTY_HOURLY, useAnalysisStore } from "../store/analysisStore";
 
-import { useAnalysisStore } from "../store/analysisStore";
+type ChartMode = "dailyTrend" | "timeOfDay" | "throughput" | "distribution" | "topP95";
 
-type ChartMode = "timeOfDay" | "throughput" | "distribution" | "topP95";
-
-export function LatencyChart({
-  rows,
-  hourlyStats = [],
-}: {
-  rows: AggregatedEndpoint[];
-  hourlyStats?: HourlyBucket[] | undefined;
-}) {
-  const [mode, setMode] = useState<ChartMode>("timeOfDay");
-  const theme = useAnalysisStore((s) => s.theme);
-  const isDark = theme === "dark";
+export function LatencyChart({ rows }: { rows: AggregatedEndpoint[] }) {
+  const { hourlyStats, dailyStats, isDark, dateFilter } = useAnalysisStore(
+    useShallow((s) => ({
+      hourlyStats: s.result?.hourlyStats ?? EMPTY_HOURLY,
+      dailyStats: s.result?.dailyStats ?? EMPTY_DAILY,
+      isDark: s.theme === "dark",
+      dateFilter: s.filters.dateFilter,
+    })),
+  );
+  const [mode, setMode] = useState<ChartMode>(dailyStats.length > 1 ? "dailyTrend" : "timeOfDay");
 
   const gridStroke = isDark ? "#1e293b" : "#f1f5f9";
   const tickColor = isDark ? "#94a3b8" : "#64748b";
@@ -101,15 +101,37 @@ export function LatencyChart({
 
   return (
     <section className="flex flex-col rounded border border-slate-200 bg-white shadow-xs dark:border-slate-800/80 dark:bg-slate-900/80 dark:shadow-md dark:shadow-black/20">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-3 py-2 dark:border-slate-800">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-700 dark:text-slate-300">
-          API Visual Analytics
-        </h2>
-        <div className="flex items-center gap-1 rounded bg-slate-100 p-0.5 text-xs dark:bg-slate-950">
+      <div className="flex flex-col gap-2 border-b border-slate-200 px-3.5 py-2.5 dark:border-slate-800">
+        <div className="flex items-center gap-2">
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-700 dark:text-slate-300">
+            API Visual Analytics
+          </h2>
+          {dateFilter !== "all" && (
+            <span className="inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">
+              {formatDate(dateFilter)}
+            </span>
+          )}
+        </div>
+        <div className="flex w-full items-center gap-1 rounded bg-slate-100 p-0.5 text-xs dark:bg-slate-950">
+          {dailyStats.length > 1 && (
+            <button
+              type="button"
+              onClick={() => setMode("dailyTrend")}
+              className={`flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded px-2 py-1 font-medium transition-colors ${
+                mode === "dailyTrend"
+                  ? "bg-white text-blue-600 shadow-xs dark:bg-blue-600 dark:text-white dark:shadow-md dark:shadow-blue-950/50"
+                  : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
+              }`}
+              title="Daily Trend (Requests, Latency, Errors across all days)"
+            >
+              <CalendarDays className="h-3.5 w-3.5" />
+              <span>Trend</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setMode("timeOfDay")}
-            className={`flex items-center gap-1.5 rounded px-2 py-1 font-medium transition-colors ${
+            className={`flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded px-2 py-1 font-medium transition-colors ${
               mode === "timeOfDay"
                 ? "bg-white text-blue-600 shadow-xs dark:bg-blue-600 dark:text-white dark:shadow-md dark:shadow-blue-950/50"
                 : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
@@ -117,12 +139,12 @@ export function LatencyChart({
             title="Time of Day vs Latency Trend"
           >
             <Clock className="h-3.5 w-3.5" />
-            <span>Time vs Latency</span>
+            <span>{dailyStats.length > 1 ? "Latency" : "Time vs Latency"}</span>
           </button>
           <button
             type="button"
             onClick={() => setMode("throughput")}
-            className={`flex items-center gap-1.5 rounded px-2 py-1 font-medium transition-colors ${
+            className={`flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded px-2 py-1 font-medium transition-colors ${
               mode === "throughput"
                 ? "bg-white text-blue-600 shadow-xs dark:bg-blue-600 dark:text-white dark:shadow-md dark:shadow-blue-950/50"
                 : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
@@ -130,12 +152,12 @@ export function LatencyChart({
             title="Hourly Request Volume & Error Rate"
           >
             <BarChart3 className="h-3.5 w-3.5" />
-            <span>Hourly Volume</span>
+            <span>{dailyStats.length > 1 ? "Volume" : "Hourly Volume"}</span>
           </button>
           <button
             type="button"
             onClick={() => setMode("distribution")}
-            className={`flex items-center gap-1.5 rounded px-2 py-1 font-medium transition-colors ${
+            className={`flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded px-2 py-1 font-medium transition-colors ${
               mode === "distribution"
                 ? "bg-white text-blue-600 shadow-xs dark:bg-blue-600 dark:text-white dark:shadow-md dark:shadow-blue-950/50"
                 : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
@@ -143,12 +165,12 @@ export function LatencyChart({
             title="Latency Distribution Buckets"
           >
             <Activity className="h-3.5 w-3.5" />
-            <span>Distribution</span>
+            <span>{dailyStats.length > 1 ? "Dist" : "Distribution"}</span>
           </button>
           <button
             type="button"
             onClick={() => setMode("topP95")}
-            className={`flex items-center gap-1.5 rounded px-2 py-1 font-medium transition-colors ${
+            className={`flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded px-2 py-1 font-medium transition-colors ${
               mode === "topP95"
                 ? "bg-white text-blue-600 shadow-xs dark:bg-blue-600 dark:text-white dark:shadow-md dark:shadow-blue-950/50"
                 : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
@@ -156,7 +178,7 @@ export function LatencyChart({
             title="Top p95 Slowest Endpoints"
           >
             <Flame className="h-3.5 w-3.5" />
-            <span>Top Slowest</span>
+            <span>{dailyStats.length > 1 ? "Slowest" : "Top Slowest"}</span>
           </button>
         </div>
       </div>
@@ -168,7 +190,77 @@ export function LatencyChart({
       ) : (
         <div className="h-[340px] px-3 py-3">
           <ResponsiveContainer width="100%" height={320}>
-            {mode === "timeOfDay" ? (
+            {mode === "dailyTrend" ? (
+              <ComposedChart data={dailyStats} margin={{ top: 10, right: 16, left: 0, bottom: 4 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={gridStroke} vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tick={{ fontSize: 10, fill: tickColor }}
+                  tickFormatter={(v) => formatDate(String(v))}
+                />
+                <YAxis
+                  yAxisId="left"
+                  tick={{ fontSize: 10, fill: tickColor }}
+                  tickFormatter={(v) => formatNum(Number(v))}
+                />
+                <YAxis
+                  yAxisId="right"
+                  orientation="right"
+                  tick={{ fontSize: 10, fill: "#7c3aed" }}
+                  tickFormatter={(v) => formatMs(Number(v))}
+                />
+                <Tooltip
+                  formatter={(val, name) => [
+                    name === "P95 Latency" || name === "Avg Latency"
+                      ? formatMs(Number(val ?? 0))
+                      : formatNum(Number(val ?? 0)),
+                    String(name),
+                  ]}
+                  labelFormatter={(lbl) => `Date: ${formatDate(String(lbl))}`}
+                  contentStyle={tooltipStyle}
+                />
+                <Legend
+                  iconType="circle"
+                  wrapperStyle={{ fontSize: 11, paddingTop: 4, color: tickColor }}
+                />
+                <Bar
+                  yAxisId="left"
+                  dataKey="count"
+                  name="Requests"
+                  fill="#3b82f6"
+                  radius={[3, 3, 0, 0]}
+                  maxBarSize={32}
+                />
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="errorCount"
+                  name="Errors"
+                  stroke="#ef4444"
+                  strokeWidth={2}
+                  dot={{ r: 3, fill: "#ef4444" }}
+                />
+                <Line
+                  yAxisId="right"
+                  type="monotone"
+                  dataKey="p95Ms"
+                  name="P95 Latency"
+                  stroke="#7c3aed"
+                  strokeWidth={2}
+                  dot={{ r: 3, fill: "#7c3aed" }}
+                />
+                <Line
+                  yAxisId="right"
+                  type="monotone"
+                  dataKey="avgMs"
+                  name="Avg Latency"
+                  stroke="#0d9488"
+                  strokeWidth={1.5}
+                  strokeDasharray="4 4"
+                  dot={{ r: 2, fill: "#0d9488" }}
+                />
+              </ComposedChart>
+            ) : mode === "timeOfDay" ? (
               <AreaChart data={hourlyStats} margin={{ top: 10, right: 16, left: 0, bottom: 4 }}>
                 <defs>
                   <linearGradient id="p99Grad" x1="0" y1="0" x2="0" y2="1">
@@ -309,6 +401,7 @@ export function LatencyChart({
                 <Tooltip
                   formatter={(value) => [formatMs(Number(value ?? 0)), "P95 Latency"]}
                   labelFormatter={(_, payload) => {
+                    // SAFETY: Recharts tooltips for topEndpoints receive the data item containing the endpoint full path.
                     const p = payload?.[0]?.payload as { full?: string } | undefined;
                     return p?.full ?? "";
                   }}

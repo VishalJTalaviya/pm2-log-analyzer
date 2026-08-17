@@ -14,7 +14,7 @@ import {
 } from "./aggregate";
 import type { ParseOptions } from "./types";
 import { METHODS } from "./types";
-function assert(cond: unknown, msg: string): asserts cond {
+function assert(cond: boolean, msg: string): asserts cond {
   if (!cond) throw new Error(`selfcheck failed: ${msg}`);
 }
 
@@ -210,13 +210,13 @@ assert(parseLine("   ").kind === "empty", "empty");
   const byKey = new Map(two.api.map((r) => [r.key, r]));
   for (const r of one.api) {
     const o = byKey.get(r.key);
-    assert(o, `missing key ${r.key}`);
+    assert(o !== undefined, `missing key ${r.key}`);
     assert(o!.count === r.count, `count ${r.key}`);
     assert(o!.errorCount === r.errorCount, `errors ${r.key}`);
     approx(o!.avgMs, r.avgMs, 1e-6);
     approx(o!.p95Ms, r.p95Ms, 1e-6);
   }
-  assert(one.summary && two.summary, "summaries present");
+  assert(one.summary !== null && two.summary !== null, "summaries present");
   assert(one.summary!.matched === two.summary!.matched, "summary matched");
   assert(one.summary!.errors === two.summary!.errors, "summary errors");
   approx(one.summary!.avg, two.summary!.avg, 1e-6);
@@ -251,7 +251,7 @@ assert(parseLine("   ").kind === "empty", "empty");
   assert(hourly[15]!.maxMs === 80, "hour 15 max");
   assert(hourly[0]!.count === 0, "empty hour remains empty");
 
-  const noHours = buildHourlyStats({ ...store, hours: undefined as unknown as Uint8Array });
+  const noHours = buildHourlyStats({ ...store, hours: undefined });
   assert(
     noHours.every((bucket) => bucket.count === 0),
     "no synthetic hourly data",
@@ -326,16 +326,58 @@ assert(parseLine("   ").kind === "empty", "empty");
   eng.finalize_paths();
   assert(eng.hit_count() === 3, `wasm hits ${eng.hit_count()}`);
   assert(eng.unmatched_count() === 1, "wasm unmatched");
-  const { decodeHourlyWire, decodePm2Partial, decodeCronWire } =
+  const { decodeHourlyWire, decodePm2Partial, decodeCronWire, decodeDatesWire, decodeDailyWire } =
     await import("../wasm/decodePartial");
-  const wire = eng.reaggregate(2, 0, 0, true); // collapseIds, all
+  const wire = eng.reaggregate(2, 0, 0, new Uint8Array(), true); // collapseIds, all, no date filter
   const { matched, unmatched, partial } = decodePm2Partial(wire);
   assert(matched === 3, "partial matched");
   assert(unmatched === 1, "partial unmatched");
   assert(partial.buckets.length >= 2, "wasm endpoints");
   const health = partial.buckets.find((b) => b.path === "/api/health" && b.method === "GET");
-  assert(health && health.count === 2, "health count");
+  assert(health !== undefined && health.count === 2, "health count");
   assert(health!.errorCount === 1, "health errors");
+
+  // Dates and daily wire check
+  const dates = decodeDatesWire(eng.dates_wire());
+  assert(dates.length === 1 && dates[0] === "2026-07-24", "wasm dates wire");
+  const dailyPartial = decodeDailyWire(eng.daily_wire());
+  assert(
+    dailyPartial.days.length === 1 && dailyPartial.days[0]!.date === "2026-07-24",
+    "wasm daily wire",
+  );
+  assert(dailyPartial.days[0]!.count === 3, "daily count");
+
+  const parseOpts: ParseOptions = {
+    normalizeMode: "collapseIds",
+    methodFilter: null,
+    statusFamily: "all",
+    minMs: 0,
+    cronQuery: "",
+    cronMinMs: 0,
+    cronShowFailedOnly: false,
+  };
+
+  // Reaggregate with matching date
+  const wireDate = eng.reaggregate(2, 0, 0, new TextEncoder().encode("2026-07-24"), true);
+  const dateRes = decodePm2Partial(wireDate);
+  assert(dateRes.matched === 3, "date matched");
+  const dateFinish = finishApiFromPartials([dateRes.partial], parseOpts, {
+    count: dateRes.matched,
+    unmatchedCount: dateRes.unmatched,
+  });
+  assert(dateFinish.summary?.matched === 3, "dateFinish summary matched 3");
+  approx(dateFinish.summary?.avg ?? 0, (12.5 + 3.1 + 40) / 3, 0.5);
+
+  // Reaggregate with non-matching date
+  const wireOtherDate = eng.reaggregate(2, 0, 0, new TextEncoder().encode("2026-08-01"), true);
+  const otherRes = decodePm2Partial(wireOtherDate);
+  assert(otherRes.matched === 0, "other date matched 0");
+  const otherFinish = finishApiFromPartials([otherRes.partial], parseOpts, {
+    count: otherRes.matched,
+    unmatchedCount: otherRes.unmatched,
+  });
+  assert(otherFinish.summary?.matched === 0, "otherFinish summary matched 0");
+
   const hourlyPartial = decodeHourlyWire(eng.hourly_wire());
   const hourlyStats = finalizeHourlyStats(hourlyPartial);
   assert(hourlyStats[0]!.count === 3, "wasm hour 0 count");
