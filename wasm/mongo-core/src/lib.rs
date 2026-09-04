@@ -60,6 +60,7 @@ impl MongoEngine {
         collection: &str,
         search_query: &str,
         high_scan_ratio_only: bool,
+        user: &str,
     ) -> String {
         let params = reagg::FilterParams {
             op,
@@ -68,6 +69,7 @@ impl MongoEngine {
             collection,
             search_query,
             high_scan_ratio_only,
+            user,
         };
         reagg::reaggregate(&self.inner, params)
     }
@@ -93,7 +95,7 @@ mod tests {
         assert_eq!(added, 1);
         assert_eq!(engine.slow_query_count(), 1);
 
-        let json = engine.reaggregate("all", 0, 0, "all", "", false);
+        let json = engine.reaggregate("all", 0, 0, "all", "", false, "all");
         assert!(json.contains("auto_master_references"));
         assert!(json.contains("\"collscanCount\":1"));
     }
@@ -112,18 +114,109 @@ mod tests {
         assert_eq!(engine.slow_query_count(), 2);
 
         // Filter: collscan only
-        let json_collscan = engine.reaggregate("all", 1, 0, "all", "", false);
+        let json_collscan = engine.reaggregate("all", 1, 0, "all", "", false, "all");
         assert!(json_collscan.contains("\"collscanCount\":1"));
         assert!(json_collscan.contains("\"slowQueryCount\":1"));
 
         // Filter: min duration 100ms
-        let json_100ms = engine.reaggregate("all", 0, 100, "all", "", false);
+        let json_100ms = engine.reaggregate("all", 0, 100, "all", "", false, "all");
         assert!(json_100ms.contains("\"slowQueryCount\":1"));
 
         // Filter: all
-        let json_all = engine.reaggregate("all", 0, 0, "all", "", false);
+        let json_all = engine.reaggregate("all", 0, 0, "all", "", false, "all");
         assert!(json_all.contains("\"slowQueryCount\":2"));
         assert!(json_all.contains("\"accepted\":1"));
         assert!(json_all.contains("\"peakConcurrent\":42"));
+    }
+
+    #[test]
+    fn test_mongo_engine_user_tracking() {
+        let mut engine = MongoEngine::new();
+        let chunk = b"{\"t\":{\"$date\":\"2026-09-01T07:57:16.966+04:00\"},\"s\":\"I\",\"c\":\"ACCESS\",\"id\":5286306,\"ctx\":\"conn10476\",\"msg\":\"Successfully authenticated\",\"attr\":{\"client\":\"103.251.212.27:50576\",\"user\":\"prit-read-only\",\"db\":\"admin\",\"doc\":{\"application\":{\"name\":\"MongoDB Compass\"}}}}\n\
+{\"t\":{\"$date\":\"2026-09-01T07:58:00.000+04:00\"},\"s\":\"I\",\"c\":\"COMMAND\",\"id\":51803,\"ctx\":\"conn10476\",\"msg\":\"Slow query\",\"attr\":{\"ns\":\"crm.cash_settlements\",\"command\":{\"find\":\"cash_settlements\"},\"planSummary\":\"COLLSCAN\",\"docsExamined\":500,\"keysExamined\":0,\"nreturned\":10,\"durationMillis\":1200}}\n\
+{\"t\":{\"$date\":\"2026-09-01T08:00:00.000+04:00\"},\"s\":\"I\",\"c\":\"ACCESS\",\"id\":20436,\"ctx\":\"conn10476\",\"msg\":\"Checking authorization failed\",\"attr\":{\"error\":{\"code\":13,\"codeName\":\"Unauthorized\",\"errmsg\":\"not authorized\"}}}\n\
+{\"t\":{\"$date\":\"2026-09-01T08:05:00.000+04:00\"},\"s\":\"I\",\"c\":\"COMMAND\",\"id\":51803,\"ctx\":\"conn99999\",\"msg\":\"Slow query\",\"attr\":{\"ns\":\"crm.other\",\"command\":{\"find\":\"other\"},\"planSummary\":\"IXSCAN\",\"docsExamined\":1,\"keysExamined\":1,\"nreturned\":1,\"durationMillis\":80}}\n";
+
+        engine.write_ingest_for_test(chunk);
+        let added = engine.feed(chunk.len() as u32, 0.0);
+        engine.end_shard();
+        assert_eq!(added, 2);
+
+        // Reaggregate all
+        let json_all = engine.reaggregate("all", 0, 0, "all", "", false, "all");
+        assert!(json_all.contains("\"userName\":\"prit-read-only\""));
+        assert!(json_all.contains("\"authFailCount\":1"));
+        assert!(json_all.contains("\"appName\":\"MongoDB Compass\""));
+        assert!(json_all.contains("\"userNames\":[\"prit-read-only\",\"system\"]"));
+
+        // Filter for prit-read-only
+        let json_user = engine.reaggregate("all", 0, 0, "all", "", false, "prit-read-only");
+        assert!(json_user.contains("\"slowQueryCount\":1"));
+        assert!(json_user.contains("cash_settlements"));
+        assert!(!json_user.contains("crm.other"));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_benchmark_feed() {
+        use std::time::Instant;
+        let p = "../../mongodb_logs_sample/methaq-mongod.log";
+        if !std::path::Path::new(p).exists() {
+            return;
+        }
+        let data = std::fs::read(p).unwrap();
+
+        // 1. Line splitting only
+        let t_split0 = Instant::now();
+        let mut lines = 0;
+        let mut cursor = 0;
+        while let Some(pos) = memchr::memchr(b'\n', &data[cursor..]) {
+            lines += 1;
+            cursor += pos + 1;
+        }
+        let split_ms = t_split0.elapsed().as_millis();
+        println!("Line split only: {} lines in {}ms", lines, split_ms);
+
+        // 2. parse_line only without store pushes
+        let t_parse0 = Instant::now();
+        let mut sq = 0;
+        cursor = 0;
+        while let Some(pos) = memchr::memchr(b'\n', &data[cursor..]) {
+            let line = &data[cursor..cursor + pos];
+            cursor += pos + 1;
+            let trimmed = crate::store::trim_line(line);
+            if !trimmed.is_empty() {
+                if let crate::parse::ParsedLine::SlowQuery(_) = crate::parse::parse_line(trimmed) {
+                    sq += 1;
+                }
+            }
+        }
+        let parse_only_ms = t_parse0.elapsed().as_millis();
+        println!("parse_line only: {} slow queries in {}ms", sq, parse_only_ms);
+
+        // 3. Full engine feed
+        let mut engine = MongoEngine::new();
+        let chunk_size = 16 * 1024 * 1024;
+        let t0 = Instant::now();
+        let mut off = 0;
+        while off < data.len() {
+            let take = (data.len() - off).min(chunk_size);
+            engine.write_ingest_for_test(&data[off..off + take]);
+            engine.feed(take as u32, off as f64);
+            off += take;
+        }
+        engine.end_shard();
+        let feed_ms = t0.elapsed().as_millis();
+        let t1 = Instant::now();
+        let json = engine.reaggregate("all", 0, 0, "all", "", false, "all");
+        let reagg_ms = t1.elapsed().as_millis();
+        println!(
+            "Rust native bench: feed={}ms ({:.1} MB/s) reagg={}ms jsonLen={} slowQueries={}",
+            feed_ms,
+            (data.len() as f64 / 1024.0 / 1024.0) / (feed_ms as f64 / 1000.0),
+            reagg_ms,
+            json.len(),
+            engine.slow_query_count()
+        );
     }
 }
