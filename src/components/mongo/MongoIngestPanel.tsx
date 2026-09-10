@@ -2,99 +2,14 @@ import { useRef, useState, type DragEvent } from "react";
 import { ClipboardPaste, Database, Plus, RefreshCw, Upload, X } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { useMongoStore } from "../../store/mongoStore";
-import { cancelMongo, parseMongoFiles, parseMongoText } from "../../hooks/useMongoParserWorker";
+import { cancelMongo, parseMongoText } from "../../hooks/useMongoParserWorker";
 import { formatBytes } from "../../utils/format";
 import { cn } from "../../utils/cn";
-import { isArchiveFile, handleArchiveUpload } from "../../utils/zipExtractor";
+import { handleLogFilesUpload, filterValidFiles } from "../../utils/zipExtractor";
 
 export const PASTE_WARN_BYTES = 8 * 1024 * 1024;
 
-const { appendLoadedFiles, setLoadedFiles, setPasteOpen, setSourcePaste, showToast } =
-  useMongoStore.getState();
-
-function filterValidFiles(fileList: FileList | File[] | null | undefined): File[] {
-  if (!fileList || fileList.length === 0) return [];
-  return Array.from(fileList).filter(
-    (f) =>
-      isArchiveFile(f) ||
-      /\.log(?:\.\d+)?$/i.test(f.name) ||
-      /\.log\d*$/i.test(f.name) ||
-      /\.(?:txt|json|out|err|\d+)$/i.test(f.name) ||
-      f.name.endsWith(".txt") ||
-      f.name.endsWith(".json") ||
-      f.type === "text/plain" ||
-      f.type === "",
-  );
-}
-
-function useMongoIngestHandlers(params: {
-  busy: boolean;
-  hasData: boolean;
-  loadedFiles: File[];
-  setPendingDrop: (v: File[] | null) => void;
-  setDragOver: (v: boolean) => void;
-  inputRef: React.RefObject<HTMLInputElement | null>;
-  setUploadMode: (v: "replace" | "append") => void;
-}) {
-  const { busy, hasData, loadedFiles, setPendingDrop, setDragOver, inputRef, setUploadMode } =
-    params;
-
-  const executeAppend = (files: File[]) => {
-    setPendingDrop(null);
-    const archive = files.find(isArchiveFile);
-    if (archive) {
-      void handleArchiveUpload(archive, "append");
-      return;
-    }
-    const existingCount = useMongoStore.getState().loadedFiles.length;
-    const combined = appendLoadedFiles(files);
-    if (combined.length === existingCount) return;
-    void parseMongoFiles(combined);
-  };
-
-  const executeReplace = (files: File[]) => {
-    setPendingDrop(null);
-    const archive = files.find(isArchiveFile);
-    if (archive) {
-      void handleArchiveUpload(archive, "replace");
-      return;
-    }
-    const unique = setLoadedFiles(files);
-    if (unique.length === 0) return;
-    void parseMongoFiles(unique);
-  };
-
-  const onDrop = (e: DragEvent) => {
-    e.preventDefault();
-    setDragOver(false);
-    if (busy) return;
-    const validFiles = filterValidFiles(e.dataTransfer.files);
-    if (validFiles.length === 0) {
-      showToast("Please upload log or archive files (.log, .zip, .gz, .txt, .json, etc.)");
-      return;
-    }
-    if (hasData && loadedFiles.length > 0) setPendingDrop(validFiles);
-    else executeReplace(validFiles);
-  };
-
-  const handleAppendClick = () => {
-    setUploadMode("append");
-    inputRef.current?.click();
-  };
-
-  const handleReplaceClick = () => {
-    setUploadMode("replace");
-    inputRef.current?.click();
-  };
-
-  return {
-    onDrop,
-    executeAppend,
-    executeReplace,
-    handleAppendClick,
-    handleReplaceClick,
-  };
-}
+const { setPasteOpen, setSourcePaste, showToast } = useMongoStore.getState();
 
 export function MongoIngestPanel() {
   const [dragOver, setDragOver] = useState(false);
@@ -115,16 +30,41 @@ export function MongoIngestPanel() {
 
   const busy = isParsing;
 
-  const { onDrop, executeAppend, executeReplace, handleAppendClick, handleReplaceClick } =
-    useMongoIngestHandlers({
-      busy,
-      hasData,
-      loadedFiles,
-      setPendingDrop,
-      setDragOver,
-      inputRef,
-      setUploadMode,
-    });
+  const executeAppend = (files: File[]) => {
+    setPendingDrop(null);
+    void handleLogFilesUpload(files, "append");
+  };
+
+  const executeReplace = (files: File[]) => {
+    setPendingDrop(null);
+    void handleLogFilesUpload(files, "replace");
+  };
+
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (busy) return;
+    const validFiles = filterValidFiles(e.dataTransfer.files);
+    if (validFiles.length === 0) {
+      showToast("Please upload log or archive files (.log, .zip, .gz, .txt, .json, etc.)");
+      return;
+    }
+    if (hasData && loadedFiles.length > 0) {
+      setPendingDrop(validFiles);
+    } else {
+      executeReplace(validFiles);
+    }
+  };
+
+  const handleAppendClick = () => {
+    setUploadMode("append");
+    inputRef.current?.click();
+  };
+
+  const handleReplaceClick = () => {
+    setUploadMode("replace");
+    inputRef.current?.click();
+  };
 
   const onDragOver = (e: DragEvent) => {
     e.preventDefault();
@@ -136,8 +76,11 @@ export function MongoIngestPanel() {
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const validFiles = filterValidFiles(e.target.files);
     e.target.value = "";
-    if (validFiles.length === 0) return;
-    if (uploadMode === "append" && hasData) {
+    if (validFiles.length === 0) {
+      showToast("Please upload log or archive files (.log, .zip, .gz, .txt, .json, etc.)");
+      return;
+    }
+    if (uploadMode === "append" && hasData && loadedFiles.length > 0) {
       executeAppend(validFiles);
     } else {
       executeReplace(validFiles);

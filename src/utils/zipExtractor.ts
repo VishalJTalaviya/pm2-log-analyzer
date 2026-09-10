@@ -7,8 +7,8 @@ import type {
 import { useAnalysisStore } from "../store/analysisStore";
 import { useMongoStore } from "../store/mongoStore";
 import { useAppModeStore } from "../store/appModeStore";
-import { parseFiles } from "../hooks/useParserWorker";
-import { parseMongoFiles } from "../hooks/useMongoParserWorker";
+import { parseFiles, parsePm2Buffer } from "../hooks/useParserWorker";
+import { parseMongoBuffer, parseMongoFiles } from "../hooks/useMongoParserWorker";
 
 const {
   appendLoadedFiles: appendPm2Files,
@@ -23,9 +23,15 @@ const {
   setLoadedFiles: setMongoFiles,
   setProgress: setMongoProgress,
   setParsing: setMongoParsing,
+  showToast: showMongoToast,
 } = useMongoStore.getState();
 
 const { setMode } = useAppModeStore.getState();
+
+function notify(message: string): void {
+  showPm2Toast(message);
+  showMongoToast(message);
+}
 
 export type ExtractedLogSet = {
   pm2Files: File[];
@@ -67,8 +73,8 @@ function getWorker(index: number): Worker {
   return workerPool[index]!;
 }
 
-// Prewarm extraction workers eagerly at module load
-for (let i = 0; i < POOL_CAP; i++) {
+// Prewarm extraction workers eagerly at module load (capped to 2 to minimize idle RSS)
+for (let i = 0; i < Math.min(POOL_CAP, 2); i++) {
   getWorker(i);
 }
 
@@ -86,7 +92,9 @@ export function isArchiveFile(file: File): boolean {
 interface ZipCentralEntry {
   name: string;
   cleanName: string;
-  dataStart: number;
+  localHeaderOffset: number;
+  nameLen: number;
+  extraLen: number;
   compressedSize: number;
   uncompressedSize: number;
   isDeflated: boolean;
@@ -100,98 +108,103 @@ function stripPathAndGz(name: string): string {
   return fileName.replace(/\.gz$/i, "");
 }
 
-function classifyByName(name: string): "pm2" | "mongo" | "unknown" | "skip" {
+export function filterValidFiles(fileList: FileList | File[] | null | undefined): File[] {
+  if (!fileList || fileList.length === 0) return [];
+  return Array.from(fileList).filter(
+    (f) =>
+      isArchiveFile(f) ||
+      /\.(?:log(?:\.\d+)?|txt|json|out|err|\d+)$/i.test(f.name) ||
+      f.type === "text/plain" ||
+      f.type === "",
+  );
+}
+
+export function classifyByName(name: string): "pm2" | "mongo" | "unknown" | "skip" {
   const lower = name.toLowerCase().replace(/\\/g, "/");
   const fileName = lower.split("/").pop() || lower;
 
   if (fileName.startsWith(".") || fileName.startsWith("__macosx") || fileName.includes("error")) {
     return "skip";
   }
-  if (
-    fileName.startsWith("mongod") ||
-    fileName.startsWith("mongodb") ||
-    fileName.startsWith("mongo.") ||
-    fileName.startsWith("mongo-") ||
-    fileName.startsWith("mongo_") ||
-    fileName.includes("mongod.log") ||
-    fileName.includes("mongodb.log")
-  ) {
+  if (/(?:^|[._-])mongo(?:[._-]|\d|$)|mongod/i.test(fileName)) {
     return "mongo";
   }
-  if (
-    fileName.includes("api-out") ||
-    fileName.includes("api_out") ||
-    fileName.startsWith("api.") ||
-    fileName.startsWith("api-") ||
-    fileName.includes("pm2") ||
-    fileName.startsWith("out.log")
-  ) {
+  if (/(?:^|[._-])(?:api[._-]out|pm2)|out\.log/i.test(fileName) || /^api[.-]/.test(fileName)) {
     return "pm2";
   }
   return "unknown";
 }
 
-function parseZipCentralDirectory(buffer: ArrayBuffer): ZipCentralEntry[] | null {
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.length;
-  if (len < 22) return null;
+async function parseZipCentralDirectoryFromFile(file: File): Promise<ZipCentralEntry[] | null> {
+  const fileSize = file.size;
+  if (fileSize < 22) return null;
 
-  // Search for EOCD signature (0x06054b50) in last 65KB
-  const searchStart = Math.max(0, len - 65557);
-  let eocdOffset = -1;
-  for (let i = len - 22; i >= searchStart; i--) {
+  const tailSize = Math.min(fileSize, 65557);
+  const tailBuffer = await file.slice(fileSize - tailSize, fileSize).arrayBuffer();
+  const tailBytes = new Uint8Array(tailBuffer);
+
+  let eocdOffsetInTail = -1;
+  for (let i = tailSize - 22; i >= 0; i--) {
     if (
-      bytes[i] === 0x50 &&
-      bytes[i + 1] === 0x4b &&
-      bytes[i + 2] === 0x05 &&
-      bytes[i + 3] === 0x06
+      tailBytes[i] === 0x50 &&
+      tailBytes[i + 1] === 0x4b &&
+      tailBytes[i + 2] === 0x05 &&
+      tailBytes[i + 3] === 0x06
     ) {
-      eocdOffset = i;
+      eocdOffsetInTail = i;
       break;
     }
   }
-  if (eocdOffset < 0) return null;
 
-  const view = new DataView(buffer);
-  const numEntries = view.getUint16(eocdOffset + 10, true);
-  const cdOffset = view.getUint32(eocdOffset + 16, true);
-  if (cdOffset >= len) return null;
+  if (eocdOffsetInTail < 0) return null;
 
+  const tailView = new DataView(tailBuffer);
+  const numEntries = tailView.getUint16(eocdOffsetInTail + 10, true);
+  const cdSize = tailView.getUint32(eocdOffsetInTail + 12, true);
+  const cdOffset = tailView.getUint32(eocdOffsetInTail + 16, true);
+
+  if (cdOffset + cdSize > fileSize) return null;
+
+  let cdBuffer: ArrayBuffer;
+  let cdOffsetInBuffer = 0;
+  const tailStartOffset = fileSize - tailSize;
+
+  if (cdOffset >= tailStartOffset) {
+    cdBuffer = tailBuffer;
+    cdOffsetInBuffer = cdOffset - tailStartOffset;
+  } else {
+    cdBuffer = await file.slice(cdOffset, cdOffset + cdSize).arrayBuffer();
+    cdOffsetInBuffer = 0;
+  }
+
+  const cdView = new DataView(cdBuffer);
+  const cdBytes = new Uint8Array(cdBuffer);
   const entries: ZipCentralEntry[] = [];
   const textDecoder = new TextDecoder("utf-8");
-  let offset = cdOffset;
+  let offset = cdOffsetInBuffer;
 
-  for (let i = 0; i < numEntries && offset + 46 <= len; i++) {
-    const sig = view.getUint32(offset, true);
+  for (let i = 0; i < numEntries && offset + 46 <= cdBuffer.byteLength; i++) {
+    const sig = cdView.getUint32(offset, true);
     if (sig !== 0x02014b50) break;
 
-    const method = view.getUint16(offset + 10, true);
-    const compSize = view.getUint32(offset + 20, true);
-    const uncompSize = view.getUint32(offset + 24, true);
-    const nameLen = view.getUint16(offset + 28, true);
-    const extraLen = view.getUint16(offset + 30, true);
-    const commentLen = view.getUint16(offset + 32, true);
-    const localHeaderOffset = view.getUint32(offset + 42, true);
+    const method = cdView.getUint16(offset + 10, true);
+    const compSize = cdView.getUint32(offset + 20, true);
+    const uncompSize = cdView.getUint32(offset + 24, true);
+    const nameLen = cdView.getUint16(offset + 28, true);
+    const extraLen = cdView.getUint16(offset + 30, true);
+    const commentLen = cdView.getUint16(offset + 32, true);
+    const localHeaderOffset = cdView.getUint32(offset + 42, true);
 
-    const nameBytes = bytes.subarray(offset + 46, offset + 46 + nameLen);
+    const nameBytes = cdBytes.subarray(offset + 46, offset + 46 + nameLen);
     const name = textDecoder.decode(nameBytes);
     const isDir = name.endsWith("/") || uncompSize === 0;
-
-    let dataStart = localHeaderOffset + 30;
-    if (localHeaderOffset + 30 <= len) {
-      const lhNameLen = view.getUint16(localHeaderOffset + 26, true);
-      const lhExtraLen = view.getUint16(localHeaderOffset + 28, true);
-      dataStart = localHeaderOffset + 30 + lhNameLen + lhExtraLen;
-    }
-
-    if (dataStart + compSize > len) {
-      return null;
-    }
 
     entries.push({
       name,
       cleanName: stripPathAndGz(name),
-      dataStart,
+      localHeaderOffset,
+      nameLen,
+      extraLen,
       compressedSize: compSize,
       uncompressedSize: uncompSize,
       isDeflated: method === 8,
@@ -207,7 +220,6 @@ function parseZipCentralDirectory(buffer: ArrayBuffer): ZipCentralEntry[] | null
 
 function extractSingleGz(
   file: File,
-  fileBuffer: ArrayBuffer,
   onProgress?: (p: { stage: string; percent: number }) => void,
 ): Promise<ExtractedLogSet> {
   const w = getWorker(0);
@@ -255,29 +267,47 @@ function extractSingleGz(
     };
     w.addEventListener("message", handleMessage);
     w.addEventListener("error", handleError);
-    w.postMessage(
-      {
-        type: "DECOMPRESS_GZ",
-        payload: { fileBuffer, fileName: file.name },
-      } satisfies ZipWorkerMessage,
-      [fileBuffer],
-    );
+    void file.arrayBuffer().then((fileBuffer) => {
+      w.postMessage(
+        {
+          type: "DECOMPRESS_GZ",
+          payload: { fileBuffer, fileName: file.name },
+        } satisfies ZipWorkerMessage,
+        [fileBuffer],
+      );
+    });
   });
 }
 
+export type Pm2ReadyPayload = {
+  files: File[];
+  directBuffer?: { buffer: ArrayBuffer; fileName: string; size: number } | undefined;
+};
+
+export type MongoReadyPayload = {
+  files: File[];
+  directBuffer?: { buffer: ArrayBuffer; fileName: string; size: number } | undefined;
+};
+
+export type ExtractArchiveCallbacks = {
+  onProgress?: (p: { stage: string; percent: number }) => void;
+  onPm2Ready?: (payload: Pm2ReadyPayload) => void;
+  onMongoReady?: (payload: MongoReadyPayload) => void;
+};
+
 export async function extractArchive(
   file: File,
-  onProgress?: (p: { stage: string; percent: number }) => void,
+  callbacks?: ExtractArchiveCallbacks,
 ): Promise<ExtractedLogSet> {
+  const cbOptions = callbacks ?? {};
   const t0 = performance.now();
-  const fileBuffer = await file.arrayBuffer();
 
   const isGz = file.name.endsWith(".gz");
   if (isGz) {
-    return extractSingleGz(file, fileBuffer, onProgress);
+    return extractSingleGz(file, cbOptions.onProgress);
   }
 
-  const entries = parseZipCentralDirectory(fileBuffer);
+  const entries = await parseZipCentralDirectoryFromFile(file);
   if (!entries) {
     throw new Error("Invalid or unsupported ZIP archive: central directory not found");
   }
@@ -305,48 +335,103 @@ export async function extractArchive(
     return { pm2Files: [], mongoFiles: [], skipped, totalBytes: 0, durationMs };
   }
 
+  const expectedPm2 = validEntries.filter((e) => e.category === "pm2").length;
+  const expectedMongo = validEntries.filter((e) => e.category === "mongo").length;
+  const hasUnknown = validEntries.some((e) => e.category === "unknown");
+  let pm2Dispatched = false;
+  let mongoDispatched = false;
+
+  validEntries.sort((a, b) => b.compressedSize - a.compressedSize);
+
   const concurrency = Math.min(
     navigator.hardwareConcurrency ? Math.max(1, navigator.hardwareConcurrency) : 4,
     validEntries.length,
   );
+
+  // Terminate any excess prewarmed workers immediately to free memory
+  while (workerPool.length > concurrency) {
+    const w = workerPool.pop();
+    w?.terminate();
+  }
 
   let completedCount = 0;
   const pm2Files: File[] = [];
   const mongoFiles: File[] = [];
   let totalBytes = 0;
 
-  const tasks = validEntries.map((entry, idx) => {
-    const workerIndex = idx % concurrency;
-    const worker = getWorker(workerIndex);
+  const queue = validEntries.map((entry, idx) => ({ entry, idx }));
 
-    const compressedBuffer = fileBuffer.slice(
-      entry.dataStart,
-      entry.dataStart + entry.compressedSize,
+  let mongoDirectBuffer: { buffer: ArrayBuffer; fileName: string; size: number } | undefined;
+  let pm2DirectBuffer: { buffer: ArrayBuffer; fileName: string; size: number } | undefined;
+
+  const extractSingleEntry = (
+    worker: Worker,
+    entry: (typeof validEntries)[number],
+    jobId: number,
+  ): Promise<void> => {
+    const sliceEnd = Math.min(
+      file.size,
+      entry.localHeaderOffset + 30 + entry.nameLen + entry.extraLen + entry.compressedSize + 1024,
     );
+    const entryBlob = file.slice(entry.localHeaderOffset, sliceEnd);
 
     return new Promise<void>((resolve, reject) => {
       const handleMessage = (e: MessageEvent<ZipWorkerResponse>) => {
         const res = e.data;
-        if (res.type === "ENTRY_RESULT" && res.payload.id === idx) {
+        if (res.type === "ENTRY_RESULT" && res.payload.id === jobId) {
           cleanup();
           const item = res.payload;
-          const extractedFile = new File([item.buffer], item.name, {
-            type: "text/plain",
-            lastModified: file.lastModified,
-          });
 
           if (item.category === "mongo") {
+            const extractedFile =
+              expectedMongo === 1
+                ? new File([], item.name, { type: "text/plain" })
+                : new File([item.buffer], item.name, { type: "text/plain" });
+            if (expectedMongo === 1) {
+              Object.defineProperty(extractedFile, "size", { value: item.size });
+            }
             mongoFiles.push(extractedFile);
+            if (item.buffer && expectedMongo === 1) {
+              mongoDirectBuffer = { buffer: item.buffer, fileName: item.name, size: item.size };
+            }
           } else {
+            const extractedFile =
+              expectedPm2 === 1
+                ? new File([], item.name, { type: "text/plain" })
+                : new File([item.buffer], item.name, { type: "text/plain" });
+            if (expectedPm2 === 1) {
+              Object.defineProperty(extractedFile, "size", { value: item.size });
+            }
             pm2Files.push(extractedFile);
+            if (item.buffer && expectedPm2 === 1) {
+              pm2DirectBuffer = { buffer: item.buffer, fileName: item.name, size: item.size };
+            }
           }
           totalBytes += item.size;
 
           completedCount++;
           const percent = Math.round((completedCount / validEntries.length) * 100);
-          onProgress?.({ stage: `Extracted ${item.name}`, percent });
+          cbOptions.onProgress?.({ stage: `Extracted ${item.name}`, percent });
+
+          // Eager dispatch when all files of a known category are ready
+          if (!hasUnknown) {
+            if (!pm2Dispatched && pm2Files.length === expectedPm2 && expectedPm2 > 0) {
+              pm2Dispatched = true;
+              cbOptions.onPm2Ready?.({
+                files: [...pm2Files],
+                directBuffer: expectedPm2 === 1 ? pm2DirectBuffer : undefined,
+              });
+            }
+            if (!mongoDispatched && mongoFiles.length === expectedMongo && expectedMongo > 0) {
+              mongoDispatched = true;
+              cbOptions.onMongoReady?.({
+                files: [...mongoFiles],
+                directBuffer: expectedMongo === 1 ? mongoDirectBuffer : undefined,
+              });
+            }
+          }
           resolve();
-        } else if (res.type === "ERROR" && res.payload.id === idx) {
+        } else if (res.type === "ERROR" && res.payload.id === jobId) {
           cleanup();
           reject(new Error(res.payload.message));
         }
@@ -365,25 +450,38 @@ export async function extractArchive(
       worker.addEventListener("message", handleMessage);
       worker.addEventListener("error", handleError);
 
-      worker.postMessage(
-        {
-          type: "EXTRACT_ENTRY",
-          payload: {
-            id: idx,
-            name: entry.name,
-            cleanName: entry.cleanName,
-            category: entry.category,
-            compressedBuffer,
-            uncompressedSize: entry.uncompressedSize,
-            isDeflated: entry.isDeflated,
-          },
-        } satisfies ZipWorkerMessage,
-        [compressedBuffer],
-      );
+      worker.postMessage({
+        type: "EXTRACT_ENTRY",
+        payload: {
+          id: jobId,
+          name: entry.name,
+          cleanName: entry.cleanName,
+          category: entry.category,
+          entryBlob,
+          compressedSize: entry.compressedSize,
+          uncompressedSize: entry.uncompressedSize,
+          isDeflated: entry.isDeflated,
+        },
+      } satisfies ZipWorkerMessage);
     });
+  };
+
+  const workerTasks = Array.from({ length: concurrency }, async (_, workerIndex) => {
+    const worker = getWorker(workerIndex);
+    try {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) break;
+        await extractSingleEntry(worker, item.entry, item.idx);
+      }
+    } finally {
+      // Worker has completed all assigned tasks; terminate immediately to free Wasm memory & thread
+      worker.terminate();
+    }
   });
 
-  await Promise.all(tasks);
+  await Promise.all(workerTasks);
+  workerPool.length = 0;
 
   const durationMs = Math.round(performance.now() - t0);
   return {
@@ -405,10 +503,60 @@ export async function handleArchiveUpload(
   setMongoParsing(true);
   setMongoProgress({ stage: "reading", processed: 10, total: 100, percent: 10 });
 
+  let pm2Started = false;
+  let mongoStarted = false;
+
+  const startPm2 = (payload: Pm2ReadyPayload) => {
+    if (pm2Started || payload.files.length === 0) return;
+    pm2Started = true;
+    if (payload.directBuffer && uploadMode === "replace") {
+      setPm2Files(payload.files);
+      void parsePm2Buffer(
+        payload.directBuffer.buffer,
+        payload.directBuffer.fileName,
+        payload.directBuffer.size,
+      );
+    } else if (uploadMode === "append") {
+      const combined = appendPm2Files(payload.files);
+      void parseFiles(combined);
+    } else {
+      const unique = setPm2Files(payload.files);
+      void parseFiles(unique);
+    }
+  };
+
+  const startMongo = (payload: MongoReadyPayload) => {
+    if (mongoStarted || payload.files.length === 0) return;
+    mongoStarted = true;
+    if (payload.directBuffer && uploadMode === "replace") {
+      setMongoFiles(payload.files);
+      void parseMongoBuffer(
+        payload.directBuffer.buffer,
+        payload.directBuffer.fileName,
+        payload.directBuffer.size,
+      );
+    } else if (uploadMode === "append") {
+      const combined = appendMongoFiles(payload.files);
+      void parseMongoFiles(combined);
+    } else {
+      const unique = setMongoFiles(payload.files);
+      void parseMongoFiles(unique);
+    }
+  };
+
   try {
-    const logSet = await extractArchive(file, (p) => {
-      setPm2Progress({ stage: "reading", processed: p.percent, total: 100, percent: p.percent });
-      setMongoProgress({ stage: "reading", processed: p.percent, total: 100, percent: p.percent });
+    const logSet = await extractArchive(file, {
+      onProgress: (p) => {
+        setPm2Progress({ stage: "reading", processed: p.percent, total: 100, percent: p.percent });
+        setMongoProgress({
+          stage: "reading",
+          processed: p.percent,
+          total: 100,
+          percent: p.percent,
+        });
+      },
+      onPm2Ready: startPm2,
+      onMongoReady: startMongo,
     });
 
     const hasPm2 = logSet.pm2Files.length > 0;
@@ -433,45 +581,32 @@ export async function handleArchiveUpload(
       return;
     }
 
-    // Ingest PM2 files if present
-    if (hasPm2) {
-      if (uploadMode === "append") {
-        const combined = appendPm2Files(logSet.pm2Files);
-        void parseFiles(combined);
-      } else {
-        const unique = setPm2Files(logSet.pm2Files);
-        void parseFiles(unique);
-      }
-    } else {
+    // In case eager dispatch didn't trigger (e.g. unknown categories)
+    if (hasPm2 && !pm2Started) {
+      startPm2({ files: logSet.pm2Files });
+    } else if (!hasPm2) {
       setPm2Parsing(false);
     }
 
-    // Ingest Mongo files if present
-    if (hasMongo) {
-      if (uploadMode === "append") {
-        const combined = appendMongoFiles(logSet.mongoFiles);
-        void parseMongoFiles(combined);
-      } else {
-        const unique = setMongoFiles(logSet.mongoFiles);
-        void parseMongoFiles(unique);
-      }
-    } else {
+    if (hasMongo && !mongoStarted) {
+      startMongo({ files: logSet.mongoFiles });
+    } else if (!hasMongo) {
       setMongoParsing(false);
     }
 
     // Tab switching and toast notification
     if (hasPm2 && hasMongo) {
-      showPm2Toast(
+      notify(
         `Extracted ${logSet.pm2Files.length} API log(s) and ${logSet.mongoFiles.length} MongoDB log(s) in ${logSet.durationMs}ms! Both tabs populated.`,
       );
     } else if (hasMongo) {
       setMode("mongo");
-      showPm2Toast(
+      notify(
         `Extracted ${logSet.mongoFiles.length} MongoDB log(s) in ${logSet.durationMs}ms into MongoDB Analyzer`,
       );
     } else {
       setMode("pm2");
-      showPm2Toast(
+      notify(
         `Extracted ${logSet.pm2Files.length} API log(s) in ${logSet.durationMs}ms into PM2 Analyzer`,
       );
     }
@@ -479,6 +614,51 @@ export async function handleArchiveUpload(
     setPm2Parsing(false);
     setMongoParsing(false);
     const errMessage = err instanceof Error ? err.message : String(err);
-    showPm2Toast(`Extraction failed: ${errMessage}`);
+    notify(`Extraction failed: ${errMessage}`);
+  }
+}
+
+export async function handleLogFilesUpload(
+  files: File[],
+  uploadMode: "replace" | "append" = "replace",
+): Promise<void> {
+  const archive = files.find(isArchiveFile);
+  if (archive) {
+    return handleArchiveUpload(archive, uploadMode);
+  }
+
+  const pm2Files: File[] = [];
+  const mongoFiles: File[] = [];
+  const activeMode = useAppModeStore.getState().mode;
+
+  for (const file of files) {
+    const cat = classifyByName(file.name);
+    if (cat === "mongo") {
+      mongoFiles.push(file);
+    } else if (cat === "pm2") {
+      pm2Files.push(file);
+    } else if (cat === "unknown") {
+      if (activeMode === "mongo") mongoFiles.push(file);
+      else pm2Files.push(file);
+    }
+  }
+
+  if (pm2Files.length > 0) {
+    const res = uploadMode === "append" ? appendPm2Files(pm2Files) : setPm2Files(pm2Files);
+    if (res.length > 0) void parseFiles(res);
+  }
+  if (mongoFiles.length > 0) {
+    const res = uploadMode === "append" ? appendMongoFiles(mongoFiles) : setMongoFiles(mongoFiles);
+    if (res.length > 0) void parseMongoFiles(res);
+  }
+
+  if (pm2Files.length > 0 && mongoFiles.length > 0) {
+    notify(
+      `Classified ${pm2Files.length} API log(s) and ${mongoFiles.length} MongoDB log(s). Both tabs populated.`,
+    );
+  } else if (mongoFiles.length > 0) {
+    setMode("mongo");
+  } else if (pm2Files.length > 0) {
+    setMode("pm2");
   }
 }
