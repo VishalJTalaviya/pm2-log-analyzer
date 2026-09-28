@@ -1,6 +1,5 @@
 import type ExcelJS from "exceljs";
 import type { MongoAggregationResult } from "./types";
-import { formatMs, formatNum } from "../utils/format";
 
 export async function exportMongoSpreadsheet(
   result: MongoAggregationResult,
@@ -241,41 +240,4 @@ export async function exportMongoSpreadsheet(
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-}
-
-export function buildMongoPatternsTsv(patterns: MongoAggregationResult["patterns"]): string {
-  const headers = [
-    "Namespace",
-    "Operation",
-    "Plan",
-    "Count",
-    "Total (s)",
-    "Avg (ms)",
-    "P95 (ms)",
-    "Max (ms)",
-    "COLLSCANs",
-    "Scan Ratio",
-    "Fingerprint",
-    "Suggested Index",
-  ];
-  const lines = [headers.join("\t")];
-  for (const p of patterns) {
-    lines.push(
-      [
-        p.ns,
-        p.op,
-        p.planSummary,
-        formatNum(p.count),
-        (p.totalDurationMs / 1000).toFixed(2),
-        formatMs(p.avgDurationMs),
-        formatMs(p.p95DurationMs),
-        formatMs(p.maxDurationMs),
-        p.collscanCount,
-        p.scanRatio,
-        p.fingerprint,
-        p.indexSuggestion || "N/A",
-      ].join("\t"),
-    );
-  }
-  return lines.join("\n");
 }

@@ -1,11 +1,14 @@
 import type {
   ParsePerfStages,
   ReaggPerfStages,
+  ShardBufferDescriptor,
   WorkerMessage,
   WorkerResponse,
 } from "../workers/logParserWorker";
 import LogParserWorker from "../workers/logParserWorker.ts?worker&inline";
 import { useAnalysisStore, workerParseOptions } from "../store/analysisStore";
+import { isTauri } from "../utils/platform";
+import { clearNative, isNativePm2Active, reaggregatePm2Native } from "../services/nativeBridge";
 
 type Pm2Bench = {
   at: string;
@@ -190,6 +193,7 @@ export async function parsePm2Buffer(
   buffer: ArrayBuffer,
   fileName: string,
   fileBytes: number,
+  fileCount = 1,
 ): Promise<void> {
   const options = workerParseOptions(useAnalysisStore.getState().filters);
   createBenchForParse("buffer", fileName, fileBytes);
@@ -197,7 +201,34 @@ export async function parsePm2Buffer(
   await runParse({ type: "PARSE_BUFFER", payload: { buffer, fileName, options } }, [buffer]);
   const ms = Math.round(performance.now() - t0);
   const result = finalizeBench(ms);
-  showToast(`Parsed ${result?.summary.matched.toLocaleString() ?? 0} requests in ${ms}ms`);
+  showToast(
+    fileCount > 1
+      ? `Parsed ${result?.summary.matched.toLocaleString() ?? 0} requests across ${fileCount} files in ${ms}ms`
+      : `Parsed ${result?.summary.matched.toLocaleString() ?? 0} requests in ${ms}ms`,
+  );
+}
+
+export async function parsePm2Shards(
+  shards: ShardBufferDescriptor[],
+  fileName: string,
+  fileBytes: number,
+  fileCount = 1,
+): Promise<void> {
+  const options = workerParseOptions(useAnalysisStore.getState().filters);
+  createBenchForParse("buffer", fileName, fileBytes);
+  const t0 = performance.now();
+  const transfer = shards.map((s) => s.buf);
+  await runParse(
+    { type: "PARSE_SHARD_BUFFERS", payload: { shards, fileName, fileBytes, options } },
+    transfer,
+  );
+  const ms = Math.round(performance.now() - t0);
+  const result = finalizeBench(ms);
+  showToast(
+    fileCount > 1
+      ? `Parsed ${result?.summary.matched.toLocaleString() ?? 0} requests across ${fileCount} files in ${ms}ms`
+      : `Parsed ${result?.summary.matched.toLocaleString() ?? 0} requests in ${ms}ms`,
+  );
 }
 
 export async function parseFile(file: File): Promise<void> {
@@ -236,13 +267,22 @@ export async function parseText(text: string): Promise<void> {
 }
 
 export async function reaggregate(): Promise<void> {
-  const options = workerParseOptions(useAnalysisStore.getState().filters);
   const t0 = performance.now();
-  await runReagg({ type: "REAGGREGATE", payload: { options } });
+  if (isTauri() && isNativePm2Active()) {
+    await reaggregatePm2Native();
+  } else {
+    const options = workerParseOptions(useAnalysisStore.getState().filters);
+    await runReagg({ type: "REAGGREGATE", payload: { options } });
+  }
   const ms = Math.round(performance.now() - t0);
   const b = ensureBench();
   b.lastReaggMs = ms;
   b.reaggTimes = [...(b.reaggTimes ?? []), ms];
+}
+
+export async function resetPm2Filters(): Promise<void> {
+  useAnalysisStore.getState().resetFilters();
+  await reaggregate();
 }
 
 export function cancel(): void {
@@ -251,6 +291,9 @@ export function cancel(): void {
 }
 
 export function clear(): void {
+  if (isTauri() && isNativePm2Active()) {
+    void clearNative();
+  }
   worker?.postMessage({ type: "CLEAR" } satisfies WorkerMessage);
   clearAnalysis();
 }

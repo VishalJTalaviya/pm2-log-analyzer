@@ -15,6 +15,16 @@ export class MongoEngine {
         wasm.mongoengine_clear(this.__wbg_ptr);
     }
     /**
+     * Encode shard data into compact transferable byte array for web worker messaging
+     * @returns {Uint8Array}
+     */
+    encode_shard() {
+        const ret = wasm.mongoengine_encode_shard(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
      * Finish shard (flush carry). Call after all feeds.
      */
     end_shard() {
@@ -39,11 +49,41 @@ export class MongoEngine {
         const ret = wasm.mongoengine_ingest_ptr(this.__wbg_ptr, len);
         return ret >>> 0;
     }
+    /**
+     * Merge another MongoEngine into this one
+     * @param {MongoEngine} other
+     */
+    merge(other) {
+        _assertClass(other, MongoEngine);
+        var ptr0 = other.__destroy_into_raw();
+        wasm.mongoengine_merge(this.__wbg_ptr, ptr0);
+    }
+    /**
+     * Merge shard byte array directly into this engine
+     * @param {Uint8Array} data
+     */
+    merge_shard_bytes(data) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.mongoengine_merge_shard_bytes(this.__wbg_ptr, ptr0, len0);
+    }
     constructor() {
         const ret = wasm.mongoengine_new();
         this.__wbg_ptr = ret;
         MongoEngineFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * Parse shard directly from the ingest window without extra copying
+     * @param {number} len
+     * @param {number} shard_start
+     * @param {number} shard_end
+     * @param {number} file_size
+     * @returns {number}
+     */
+    parse_shard_ingest(len, shard_start, shard_end, file_size) {
+        const ret = wasm.mongoengine_parse_shard_ingest(this.__wbg_ptr, len, shard_start, shard_end, file_size);
+        return ret >>> 0;
     }
     /**
      * Fast reaggregate returning serialized JSON string.
@@ -118,6 +158,17 @@ const MongoEngineFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_mongoengine_free(ptr, 1));
 
+function _assertClass(instance, klass) {
+    if (!(instance instanceof klass)) {
+        throw new Error(`expected instance of ${klass.name}`);
+    }
+}
+
+function getArrayU8FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
+}
+
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
 }
@@ -128,6 +179,13 @@ function getUint8ArrayMemory0() {
         cachedUint8ArrayMemory0 = new Uint8Array(wasm.memory.buffer);
     }
     return cachedUint8ArrayMemory0;
+}
+
+function passArray8ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 1, 1) >>> 0;
+    getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
 }
 
 function passStringToWasm0(arg, malloc, realloc) {

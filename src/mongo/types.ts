@@ -1,4 +1,12 @@
-import type { MongoDoc } from "./fingerprint";
+export type MongoParsedNode =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly MongoParsedNode[]
+  | { readonly [key: string]: MongoParsedNode };
+
+export type MongoDoc = { readonly [key: string]: MongoParsedNode };
 
 export type MongoSeverity = "I" | "W" | "E" | "F" | "D";
 
@@ -269,6 +277,19 @@ export const DEFAULT_MONGO_FILTERS: MongoFilters = {
   dateFilter: "all",
   userFilter: "all",
 };
+
+export function countActiveMongoFilters(filters: MongoFilters): number {
+  let count = 0;
+  if (filters.searchQuery.trim() !== "") count++;
+  if (filters.planFilter !== "all") count++;
+  if (filters.operation !== "all") count++;
+  if (filters.collection !== "all") count++;
+  if (filters.userFilter !== "all") count++;
+  if (filters.minDurationMs > 0) count++;
+  if (filters.highScanRatioOnly) count++;
+  if (filters.dateFilter !== "all") count++;
+  return count;
+}
 
 export const EMPTY_MONGO_RESULT: MongoAggregationResult = {
   summary: {

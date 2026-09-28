@@ -15,13 +15,26 @@ const coiHeaders = {
 
 // https://vite.dev/config/
 export default defineConfig({
+  clearScreen: false,
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),
     },
   },
-  server: { headers: coiHeaders },
+  server: {
+    port: 5173,
+    strictPort: true,
+    headers: coiHeaders,
+    // Cargo/tauri builds write thousands of files into src-tauri/target, and the
+    // watcher sends every one of those events to the dev server, which stalls
+    // module responses for seconds (measured: 16.4s to first paint while a
+    // build runs vs 0.5s idle). Nothing under src-tauri is part of the web app.
+    watch: { ignored: ["**/src-tauri/**", "**/target/**"] },
+  },
+  optimizeDeps: {
+    entries: ["index.html"],
+  },
   preview: { headers: coiHeaders },
   worker: {
     format: "es",

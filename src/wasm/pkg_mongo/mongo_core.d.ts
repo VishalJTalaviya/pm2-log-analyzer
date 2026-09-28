@@ -6,6 +6,10 @@ export class MongoEngine {
     [Symbol.dispose](): void;
     clear(): void;
     /**
+     * Encode shard data into compact transferable byte array for web worker messaging
+     */
+    encode_shard(): Uint8Array;
+    /**
      * Finish shard (flush carry). Call after all feeds.
      */
     end_shard(): void;
@@ -17,7 +21,19 @@ export class MongoEngine {
      * Grow ingest window to `len` bytes; returns pointer into Wasm memory for JS writes.
      */
     ingest_ptr(len: number): number;
+    /**
+     * Merge another MongoEngine into this one
+     */
+    merge(other: MongoEngine): void;
+    /**
+     * Merge shard byte array directly into this engine
+     */
+    merge_shard_bytes(data: Uint8Array): void;
     constructor();
+    /**
+     * Parse shard directly from the ingest window without extra copying
+     */
+    parse_shard_ingest(len: number, shard_start: number, shard_end: number, file_size: number): number;
     /**
      * Fast reaggregate returning serialized JSON string.
      */
@@ -32,17 +48,21 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_mongoengine_free: (a: number, b: number) => void;
     readonly mongoengine_clear: (a: number) => void;
+    readonly mongoengine_encode_shard: (a: number) => [number, number];
     readonly mongoengine_end_shard: (a: number) => void;
     readonly mongoengine_feed: (a: number, b: number, c: number) => number;
     readonly mongoengine_ingest_ptr: (a: number, b: number) => number;
+    readonly mongoengine_merge: (a: number, b: number) => void;
+    readonly mongoengine_merge_shard_bytes: (a: number, b: number, c: number) => void;
     readonly mongoengine_new: () => number;
+    readonly mongoengine_parse_shard_ingest: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly mongoengine_reaggregate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number];
     readonly mongoengine_slow_query_count: (a: number) => number;
     readonly mongoengine_total_lines: (a: number) => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_start: () => void;
 }
 
