@@ -20,7 +20,12 @@ export class FastDecompressor {
      * Decompress Gzip bytes directly into linear memory.
      */
     decompress_gzip(gz_bytes: Uint8Array): number;
+    /**
+     * Decode a dictionary-reset LZMA2 range into a reusable worker output window.
+     */
+    decompress_lzma2(compressed: Uint8Array, dict_size: number, output_size: number): number;
     constructor();
+    output_crc(offset: number, length: number): number;
     output_len(): number;
     output_ptr(): number;
 }
@@ -30,18 +35,34 @@ export class FastDecompressor {
  */
 export function classify_log_name_or_content(name: string, sample: Uint8Array): string;
 
+export function extract_tar_wasm(data: Uint8Array, on_entry: Function, on_skipped: Function): number;
+
+/**
+ * Returns a metadata-only LZMA2 plan, or undefined when the general decoder is required.
+ */
+export function inspect_sevenz(signature: Uint8Array, tail: Uint8Array, tail_offset: number, length: number): string | undefined;
+
+export function sevenz_crc_combine(left: number, right: number, right_length: number): number;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_fastdecompressor_free: (a: number, b: number) => void;
     readonly classify_log_name_or_content: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly extract_tar_wasm: (a: number, b: number, c: any, d: any) => [number, number, number];
     readonly fastdecompressor_clear: (a: number) => void;
     readonly fastdecompressor_decompress_deflate: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly fastdecompressor_decompress_gzip: (a: number, b: number, c: number) => [number, number, number];
+    readonly fastdecompressor_decompress_lzma2: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly fastdecompressor_new: () => number;
+    readonly fastdecompressor_output_crc: (a: number, b: number, c: number) => [number, number, number];
     readonly fastdecompressor_output_len: (a: number) => number;
     readonly fastdecompressor_output_ptr: (a: number) => number;
+    readonly inspect_sevenz: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
+    readonly sevenz_crc_combine: (a: number, b: number, c: number) => number;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
