@@ -25,6 +25,7 @@ tauri = { version = "2.11.6", features = [] }
 tauri-plugin-dialog = "2.7.3"
 pm2-core = { path = "../wasm/pm2-core" }
 mongo-core = { path = "../wasm/mongo-core" }
+nginx-core = { path = "../wasm/nginx-core" }
 memmap2 = "0.9"
 rayon = "1.12"
 hashbrown = "0.17"
@@ -43,9 +44,6 @@ tar = { version = "0.4.46", default-features = false }
 pbz2 = { version = "0.2.0", default-features = false, features = ["simd"] }
 liblzma = { version = "0.4.8", default-features = false, features = ["static", "parallel"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-
-[dev-dependencies]
-bzip2 = "0.6.1"
 
 [profile.release]
 opt-level = 3
