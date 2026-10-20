@@ -11,6 +11,8 @@ use crate::{Engine, Normalized, Row};
 pub struct Filters {
     pub normalize_mode: String,
     pub status_family: String,
+    /// Exact HTTP status; 0 matches every status.
+    pub status_code: u16,
     pub min_ms: f64,
     pub methods: Vec<String>,
     pub query: String,
@@ -26,6 +28,7 @@ impl Default for Filters {
         Self {
             normalize_mode: "collapseIds".into(),
             status_family: "all".into(),
+            status_code: 0,
             min_ms: 0.0,
             methods: Vec::new(),
             query: String::new(),
@@ -98,7 +101,7 @@ pub struct Hotspot {
 }
 
 /// Endpoints need this many timed requests before their p95 is ranked as slowest.
-const HOTSPOT_MIN_TIMED: u64 = 10;
+const HOTSPOT_MIN_TIMED: u64 = 1;
 const HOTSPOT_LIMIT: usize = 5;
 
 #[derive(Serialize)]
@@ -385,9 +388,34 @@ impl Engine {
             None => (&self.paths.values, None),
         };
         let query = filters.query.to_lowercase();
+        let parts: Vec<&str> = query.split_whitespace().collect();
+        let mut client_queries: Vec<&str> = Vec::new();
+        let mut text_parts: Vec<&str> = Vec::new();
+        for &part in &parts {
+            if let Some(ip) = part.strip_prefix("ip:") {
+                client_queries.push(ip);
+            } else if parts.len() > 1 && part.parse::<std::net::IpAddr>().is_ok() {
+                client_queries.push(part);
+            } else {
+                text_parts.push(part);
+            }
+        }
+        let text_query = text_parts.join(" ");
         let path_allowed: Vec<bool> = path_values
             .iter()
-            .map(|path| query.is_empty() || path.to_lowercase().contains(&query))
+            .map(|path| text_query.is_empty() || path.to_lowercase().contains(&text_query))
+            .collect();
+        let client_allowed: Vec<(bool, bool)> = self
+            .clients
+            .values
+            .iter()
+            .map(|client| {
+                let client = client.to_lowercase();
+                (
+                    text_query.is_empty() || client.contains(&text_query),
+                    client_queries.iter().all(|query| client == *query),
+                )
+            })
             .collect();
         let method_allowed: Vec<bool> = self
             .methods
@@ -410,6 +438,8 @@ impl Engine {
             "3xx" => 3,
             "4xx" => 4,
             "5xx" => 5,
+            // 4xx + 5xx, the same responses counted as errors.
+            "errors" => 9,
             _ => 0,
         };
         let mut summary = Metrics::default();
@@ -422,10 +452,14 @@ impl Engine {
         let mut statuses = HashMap::new();
         for row in &self.rows {
             let path = path_ids.map_or(row.path, |ids| ids[row.path as usize]);
-            if !path_allowed[path as usize]
+            let (client_matches, exact_client_matches) = client_allowed[row.client as usize];
+            if (!path_allowed[path as usize] && !client_matches)
+                || !exact_client_matches
                 || !method_allowed[row.method as usize]
                 || !date_allowed[row.date as usize]
-                || (family != 0 && row.status / 100 != family)
+                || (family == 9 && row.status < 400)
+                || (family != 0 && family != 9 && row.status / 100 != family)
+                || (filters.status_code != 0 && row.status != filters.status_code)
             {
                 continue;
             }
