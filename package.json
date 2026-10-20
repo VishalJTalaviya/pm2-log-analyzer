@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "node api.js && vite",
+    "build": "node api.js && vite build",
     "preview": "vite preview",
     "lint": "oxlint && tsc --noEmit",
     "lint:fix": "oxlint --fix && tsc --noEmit",
@@ -28,15 +28,17 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:build:exe": "tauri build --no-bundle",
-    "build:exe": "tauri build --no-bundle"
+    "build:exe": "node api.js && tauri build --no-bundle"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "clsx": "2.1.1",
+    "dotenv": "^8.2.0",
     "exceljs": "^4.4.0",
     "flag-icons": "7.5.0",
     "lucide-react": "^1.48.0",
+    "node-fetch": "^3.3.2",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "react-window": "^2.3.3",

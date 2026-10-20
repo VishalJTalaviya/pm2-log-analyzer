@@ -7,14 +7,11 @@ build/
 *.local
 
 # Environment files
-.env
-.env.local
 .env.development.local
 .env.test.local
 .env.production.local
 
 # IDE/Editor
-.vscode/
 .idea/
 .cursor/
 *.swp
@@ -58,3 +55,4 @@ src-tauri/gen/
 
 # Test data
 test_data/
+config.bat
